@@ -1,0 +1,40 @@
+[submodule "third_party/mesa"]
+	path = third_party/mesa
+	url = https://gitlab.freedesktop.org/mesa/mesa.git
+	branch = main
+[submodule "third_party/glslang"]
+	path = third_party/glslang
+	url = https://github.com/KhronosGroup/glslang.git
+	branch = main
+[submodule "third_party/Vulkan-ValidationLayers"]
+	path = third_party/Vulkan-ValidationLayers
+	url = https://github.com/KhronosGroup/Vulkan-ValidationLayers.git
+	branch = main
+[submodule "third_party/SPIRV-Tools"]
+	path = third_party/SPIRV-Tools
+	url = https://github.com/KhronosGroup/SPIRV-Tools.git
+	branch = main
+[submodule "third_party/SPIRV-Cross"]
+	path = third_party/SPIRV-Cross
+	url = https://github.com/KhronosGroup/SPIRV-Cross.git
+	branch = main
+[submodule "third_party/Vulkan-Tools"]
+	path = third_party/Vulkan-Tools
+	url = https://github.com/KhronosGroup/Vulkan-Tools.git
+	branch = main
+[submodule "third_party/VK-GL-CTS"]
+	path = third_party/VK-GL-CTS
+	url = https://github.com/KhronosGroup/VK-GL-CTS.git
+	branch = main
+[submodule "third_party/MoltenVK"]
+	path = third_party/MoltenVK
+	url = https://github.com/KhronosGroup/MoltenVK.git
+	branch = main
+[submodule "third_party/vkpeak"]
+	path = third_party/vkpeak
+	url = https://github.com/nihui/vkpeak.git
+	branch = master
+[submodule "third_party/vk_cooperative_matrix_perf"]
+	path = third_party/vk_cooperative_matrix_perf
+	url = https://github.com/jeffbolznv/vk_cooperative_matrix_perf.git
+	branch = master
