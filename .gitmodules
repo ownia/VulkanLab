@@ -38,3 +38,11 @@
 	path = third_party/vk_cooperative_matrix_perf
 	url = https://github.com/jeffbolznv/vk_cooperative_matrix_perf.git
 	branch = master
+[submodule "third_party/Vulkan-Headers"]
+	path = third_party/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+	branch = main
+[submodule "third_party/SPIRV-Headers"]
+	path = third_party/SPIRV-Headers
+	url = https://github.com/KhronosGroup/SPIRV-Headers.git
+	branch = main

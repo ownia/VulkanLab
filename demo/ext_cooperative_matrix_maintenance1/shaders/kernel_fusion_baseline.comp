@@ -1,0 +1,99 @@
+/* ============================================================================
+ * KHR-Only Baseline: Stable Row-Wise Softmax Via Shared Memory
+ *
+ * Y = row_softmax(2 * X + column_bias), one subgroup per workgroup.
+ *
+ *     [Input X]                          [Column bias]
+ *         |                                   |
+ *         v                                   v
+ *   [coopMatLoad]                  [coopMatLoad, stride 0]
+ *         |                                   |
+ *         v                                   |
+ *    [Scale by 2]                             |
+ *         |                                   |
+ *         +-----------------------------------+
+ *         |
+ *         v
+ *   [Add matrices: 2 * X + column_bias]
+ *         |
+ *         v
+ *   [coopMatStore -> shared row-major tile]
+ *         |
+ *         v
+ *   [barrier(): all invocations can read complete rows]
+ *         |
+ *         v
+ *   [row = gl_LocalInvocationIndex]
+ *         |
+ *         v
+ *   +--> <row < rows?> -- no --> [Done]
+ *   |         |
+ *   |        yes
+ *   |         v
+ *   |   [Find row maximum]
+ *   |         |
+ *   |         v
+ *   |   [exp(value - row maximum), accumulate row sum]
+ *   |         |
+ *   |         v
+ *   |   [Divide by row sum -> this workgroup's output Y row]
+ *   |         |
+ *   |         v
+ *   +---[row += gl_WorkGroupSize.x]
+ *
+ * Shared memory exposes logical rows without assuming matrix ownership.
+ * One dispatch; no intermediate storage buffer.
+ *
+ * Binding 0: one row-major FP32 X tile, shared by all workgroups.
+ * Binding 1: one separate row-major FP32 Y tile per workgroup.
+ * Binding 2: one FP32 bias value per logical column, shared by all workgroups.
+ * Specialization IDs: 0 = local_size_x, 1 = rows, 2 = columns.
+ * ============================================================================ */
+
+#version 450
+#pragma use_vulkan_memory_model
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 1) const int rows = 8;
+layout(constant_id = 2) const int columns = 8;
+
+#define MATRIX coopmat<float, gl_ScopeSubgroup, rows, columns, gl_MatrixUseAccumulator>
+
+layout(set = 0, binding = 0, std430) readonly coherent buffer Input {
+    float values[];
+} inputData;
+layout(set = 0, binding = 1, std430) writeonly coherent buffer Output {
+    float values[];
+} outputData;
+layout(set = 0, binding = 2, std430) readonly coherent buffer Bias {
+    float values[];
+} biasData;
+
+shared float tile[rows * columns];
+
+void main() {
+    MATRIX matrix, columnBias;
+    coopMatLoad(matrix, inputData.values, 0u, uint(columns), gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(columnBias, biasData.values, 0u, 0u, gl_CooperativeMatrixLayoutRowMajor);
+    matrix = matrix * 2.0;
+    matrix = matrix + columnBias;
+    coopMatStore(matrix, tile, 0u, uint(columns), gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    uint outputOffset = gl_WorkGroupID.x * uint(rows * columns);
+    for (uint row = gl_LocalInvocationIndex; row < uint(rows); row += gl_WorkGroupSize.x) {
+        uint first = row * uint(columns);
+        float rowMaximum = tile[first];
+        for (uint column = 1u; column < uint(columns); ++column)
+            rowMaximum = max(rowMaximum, tile[first + column]);
+        float rowSum = 0.0;
+        for (uint column = 0u; column < uint(columns); ++column) {
+            float value = exp(tile[first + column] - rowMaximum);
+            tile[first + column] = value;
+            rowSum += value;
+        }
+        for (uint column = 0u; column < uint(columns); ++column)
+            outputData.values[outputOffset + first + column] = tile[first + column] / rowSum;
+    }
+}
