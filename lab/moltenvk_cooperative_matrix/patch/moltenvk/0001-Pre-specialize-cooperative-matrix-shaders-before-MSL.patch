@@ -1,0 +1,387 @@
+From 13bde6e2d1ee75baaba62308cb8d67ef487e1f14 Mon Sep 17 00:00:00 2001
+From: Weizhao Ouyang <o451686892@gmail.com>
+Date: Tue, 13 Oct 2026 15:55:17 +0800
+Subject: [PATCH] Pre-specialize cooperative matrix shaders before MSL
+ conversion
+
+- Apply, freeze and fold specialization constants on a SPIR-V copy
+  using SPIRV-Tools-opt.
+- Include specialization values in shader cache matching and
+  serialization, and version the cache format.
+- Avoid full reflection for shaders without cooperative matrices.
+- Skip redundant optimizer input validation.
+- Gate cooperative matrix availability on SPIRV-Tools.
+- Use RAII for compiler lifetimes and propagate conversion failures.
+
+Signed-off-by: Weizhao Ouyang <o451686892@gmail.com>
+---
+ CMakeLists.txt                                |  2 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     | 10 ++-
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   |  6 +-
+ .../MoltenVK/GPUObjects/MVKShaderModule.h     | 11 +++
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm    | 49 +++++++++++++
+ .../MoltenVKShaderConverter/CMakeLists.txt    |  2 +-
+ .../SPIRVToMSLConverter.cpp                   | 73 ++++++++++++++++---
+ .../SPIRVToMSLConverter.h                     |  4 +
+ 8 files changed, 140 insertions(+), 17 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1d1ef2b90fa7..a7b3c31d9007 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -65,7 +65,7 @@ project(MoltenVK
+ set(MVK_CONFIG_LOG_LEVEL "info" CACHE STRING "Set the default log level for MoltenVK. Options are: debug, info, warn, error, off. Default is 'info'.")
+ set_property(CACHE MVK_CONFIG_LOG_LEVEL PROPERTY STRINGS "debug" "info" "warn" "error" "off")
+ 
+-option(MVK_EXCLUDE_SPIRV_TOOLS "Exclude the SPIRV-Tools dependency. If excluded, disables printing debug SPIR-V disassembly." OFF)
++option(MVK_EXCLUDE_SPIRV_TOOLS "Exclude SPIRV-Tools, disabling debug SPIR-V disassembly and cooperative matrices." OFF)
+ option(MVK_EXCLUDE_CEREAL "Exclude the cereal dependency. If excluded, disables reading and writing pipeline caches." OFF)
+ option(MVK_USE_METAL_PRIVATE_API "If enabled, MoltenVK will use private interfaces exposed by Metal to implement Vulkan features that are difficult to support otherwise." OFF)
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index bb34df8db1e1..262e6985c457 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -1940,7 +1940,7 @@ VkResult MVKPhysicalDevice::getCooperativeMatrixProperties(uint32_t* pPropertyCo
+           VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, 
+           VK_FALSE, VK_SCOPE_SUBGROUP_KHR }
+     };
+-	uint32_t propCnt = sizeof(coopMatProps) / sizeof(coopMatProps[0]);
++	uint32_t propCnt = _metalFeatures.cooperativeMatrix ? sizeof(coopMatProps) / sizeof(coopMatProps[0]) : 0;
+ 
+ 	if (!pProperties) {
+ 		*pPropertyCount = propCnt;
+@@ -2668,7 +2668,9 @@ void MVKPhysicalDevice::initMetalFeatures() {
+ 		_metalFeatures.samplerClampToBorder = !MVK_TVOS || mvkOSVersionIsAtLeast(16.0);
+ 		_metalFeatures.samplerMirrorClampToEdge = !MVK_TVOS || mvkOSVersionIsAtLeast(16.0);
+ 		_metalFeatures.simdReduction = true;
++#if !MVK_EXCLUDE_SPIRV_TOOLS
+ 		_metalFeatures.cooperativeMatrix = true;
++#endif
+ 	}
+ 
+ 	if (supportsMTLGPUFamily(Apple10)) {
+@@ -3359,6 +3361,9 @@ void MVKPhysicalDevice::initPipelineCacheUUID() {
+ 	mtlFeatures |= _isUsingMetalArgumentBuffers << 0;
+ 	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mtlFeatures);
+ 	uuidComponentOffset += sizeof(mtlFeatures);
++
++	constexpr uint32_t shaderCacheFormatVersion = 1;
++	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(shaderCacheFormatVersion);
+ }
+ 
+ // Combine OS major (8 bits), OS minor (8 bits), Mac GPU family (8 bits), and
+@@ -3593,6 +3598,9 @@ void MVKPhysicalDevice::initExtensions() {
+ 	MVKExtensionList* pWritableExtns = (MVKExtensionList*)&_supportedExtensions;
+ 	pWritableExtns->disableAllButEnabledDeviceExtensions();
+ 
++	if (!_metalFeatures.cooperativeMatrix) {
++		pWritableExtns->vk_KHR_cooperative_matrix.enabled = false;
++	}
+ 	if (!_metalFeatures.subgroupUniformControlFlow) {
+ 		pWritableExtns->vk_KHR_shader_subgroup_uniform_control_flow.enabled = false;
+ 	}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 47bbd4fca633..afdffc239510 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2959,7 +2959,9 @@ namespace mvk {
+ 				cfg.shaderOutputs,
+ 				cfg.resourceBindings,
+ 				cfg.discreteDescriptorSets,
+-				cfg.dynamicBufferDescriptors);
++				cfg.dynamicBufferDescriptors,
++				cfg.shouldSpecializeSPIRV,
++				cfg.specializationConstants);
+ 	}
+ 
+ 	template<class Archive>
+@@ -3134,7 +3136,7 @@ void mvkValidateCeralArchiveDefinitions() {
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(104);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(127);	// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+index c5b74991d5e1..74311208bf9b 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+@@ -274,6 +274,17 @@ protected:
+ 	friend MVKShaderCacheIterator;
+ 
+ 	void propagateDebugName() override {}
++	bool populateSPIRVSpecialization(mvk::SPIRVToMSLConversionConfiguration& shaderConfig,
++									const VkSpecializationInfo* specializationInfo);
++
++	struct SpecializationConstantType {
++		size_t size;
++		bool isBoolean;
++	};
++
++	std::once_flag _specializationInfoOnce;
++	bool _shouldSpecializeSPIRV = false;
++	std::map<uint32_t, SpecializationConstantType> _specializationConstantTypes;
+ 
+ 	MVKShaderLibraryCache _shaderLibraryCache;
+ 	mvk::SPIRVToMSLConverter _spvConverter;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 3aa44a44bb09..02c70f171dba 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -393,10 +393,59 @@ MVKShaderLibraryCache::~MVKShaderLibraryCache() {
+ #pragma mark -
+ #pragma mark MVKShaderModule
+ 
++bool MVKShaderModule::populateSPIRVSpecialization(SPIRVToMSLConversionConfiguration& shaderConfig,
++												 const VkSpecializationInfo* specializationInfo) {
++	shaderConfig.shouldSpecializeSPIRV = false;
++	shaderConfig.specializationConstants.clear();
++
++#ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
++	try {
++#endif
++		std::call_once(_specializationInfoOnce, [&] {
++			if (!_spvConverter.hasSPIRV()) { return; }
++			_shouldSpecializeSPIRV = _spvConverter.needsSPIRVSpecialization();
++			if (!_shouldSpecializeSPIRV) { return; }
++			SPIRV_CROSS_NAMESPACE::Compiler compiler(_spvConverter.getSPIRV());
++			for (const auto& specialization : compiler.get_specialization_constants()) {
++				const auto& constant = compiler.get_constant(specialization.id);
++				const auto& type = compiler.get_type(constant.constant_type);
++				bool isBoolean = type.basetype == SPIRV_CROSS_NAMESPACE::SPIRType::Boolean;
++				_specializationConstantTypes[specialization.constant_id] = {
++					isBoolean ? sizeof(VkBool32) : (type.width + 7) / 8, isBoolean
++				};
++			}
++		});
++#ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
++	} catch (const SPIRV_CROSS_NAMESPACE::CompilerError& error) {
++		reportError(VK_ERROR_INITIALIZATION_FAILED, "Could not inspect SPIR-V specialization constants: %s", error.what());
++		return false;
++	}
++#endif
++
++	shaderConfig.shouldSpecializeSPIRV = _shouldSpecializeSPIRV;
++	if (!_shouldSpecializeSPIRV || !specializationInfo) { return true; }
++	for (uint32_t entryIndex = 0; entryIndex < specializationInfo->mapEntryCount; ++entryIndex) {
++		const auto& entry = specializationInfo->pMapEntries[entryIndex];
++		auto constantType = _specializationConstantTypes.find(entry.constantID);
++		if (constantType == _specializationConstantTypes.end()) { continue; }
++		if (entry.size != constantType->second.size || !specializationInfo->pData ||
++			entry.offset > specializationInfo->dataSize || entry.size > specializationInfo->dataSize - entry.offset) {
++			reportError(VK_ERROR_INITIALIZATION_FAILED, "Invalid specialization data for SpecId %u.", entry.constantID);
++			return false;
++		}
++		auto& value = shaderConfig.specializationConstants[entry.constantID];
++		value.resize((entry.size + sizeof(uint32_t) - 1) / sizeof(uint32_t), 0);
++		memcpy(value.data(), static_cast<const uint8_t*>(specializationInfo->pData) + entry.offset, entry.size);
++		if (constantType->second.isBoolean) { value[0] = value[0] != 0; }
++	}
++	return true;
++}
++
+ MVKMTLFunction MVKShaderModule::getMTLFunction(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 											   const VkSpecializationInfo* pSpecializationInfo,
+ 											   MVKPipeline* pipeline,
+ 											   VkPipelineCreationFeedback* pShaderFeedback) {
++	if (!populateSPIRVSpecialization(*pShaderConfig, pSpecializationInfo)) { return MVKMTLFunctionNull; }
+ 	MVKShaderLibrary* mvkLib = _directMSLLibrary;
+ 	if ( !mvkLib ) {
+ 		uint64_t startTime = pShaderFeedback ? mvkGetTimestamp() : getPerformanceTimestamp();
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/CMakeLists.txt b/MoltenVKShaderConverter/MoltenVKShaderConverter/CMakeLists.txt
+index 8618ed8a6054..2b9f31fd2634 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/CMakeLists.txt
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/CMakeLists.txt
+@@ -22,7 +22,7 @@ target_link_libraries(MoltenVK_ShaderConverter PUBLIC SPRIV-Cross::SPRIV-Cross)
+ 
+ if (NOT MVK_EXCLUDE_SPIRV_TOOLS)
+ 	include(SPIRV-Tools)
+-	target_link_libraries(MoltenVK_ShaderConverter PUBLIC SPIRV-Tools::SPIRV-Tools)
++	target_link_libraries(MoltenVK_ShaderConverter PUBLIC SPIRV-Tools::SPIRV-Tools SPIRV-Tools-opt)
+ else()
+ 	target_compile_definitions(MoltenVK_ShaderConverter PUBLIC MVK_EXCLUDE_SPIRV_TOOLS=1)
+ endif()
+\ No newline at end of file
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+index 7a6272ca2584..498dda91a5d2 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+@@ -22,6 +22,11 @@
+ #include "FileSupport.h"
+ #include "SPIRVSupport.h"
+ #include <fstream>
++#include <memory>
++
++#if !MVK_EXCLUDE_SPIRV_TOOLS
++#include <spirv-tools/optimizer.hpp>
++#endif
+ 
+ using namespace mvk;
+ using namespace std;
+@@ -191,6 +196,8 @@ MVK_PUBLIC_SYMBOL void SPIRVToMSLConversionConfiguration::markAllInterfaceVarsAn
+ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToMSLConversionConfiguration& other) const {
+ 
+     if ( !options.matches(other.options) ) { return false; }
++	if (shouldSpecializeSPIRV != other.shouldSpecializeSPIRV) { return false; }
++	if (specializationConstants != other.specializationConstants) { return false; }
+ 
+ 	for (const auto& si : shaderInputs) {
+ 		if (si.outIsUsedByShader && !containsMatching(other.shaderInputs, si)) { return false; }
+@@ -266,6 +273,22 @@ MVK_PUBLIC_SYMBOL void SPIRVToMSLConverter::setSPIRV(const uint32_t* spirvCode,
+ 	}
+ }
+ 
++MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::needsSPIRVSpecialization() const {
++	bool needsSpecialization = false;
++#if !MVK_EXCLUDE_SPIRV_TOOLS
++	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
++	auto parseHeader = [](spv_endianness_t, const spv_parsed_header_t&) { return SPV_SUCCESS; };
++	tools.Parse(_spirv, parseHeader, [&](const spv_parsed_instruction_t& instruction) {
++		if (instruction.opcode == OpNop) { return SPV_SUCCESS; }
++		if (instruction.opcode != OpCapability) { return SPV_REQUESTED_TERMINATION; }
++		if (instruction.words[1] != CapabilityCooperativeMatrixKHR) { return SPV_SUCCESS; }
++		needsSpecialization = true;
++		return SPV_REQUESTED_TERMINATION;
++	});
++#endif
++	return needsSpecialization;
++}
++
+ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfiguration& shaderConfig,
+ 													SPIRVToMSLConversionResult& conversionResult,
+ 													bool shouldLogSPIRV,
+@@ -279,13 +302,40 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 
+ 	if (shouldLogSPIRV) { logSPIRV(conversionResult.resultLog, "Converting"); }
+ 
+-	CompilerMSL* pMSLCompiler = nullptr;
+-	bool wasConverted = true;
++	vector<uint32_t> specializedSPIRV;
++	if (shaderConfig.shouldSpecializeSPIRV) {
++#if MVK_EXCLUDE_SPIRV_TOOLS
++		return logError(conversionResult.resultLog, "SPIR-V specialization requires SPIRV-Tools.");
++#else
++		spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
++		optimizer.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t& position, const char* message) {
++			string diagnostic = "SPIR-V specialization at word " + to_string(position.index) + ": " + message;
++			logMsg(conversionResult.resultLog, diagnostic.c_str());
++		});
++		unordered_map<uint32_t, vector<uint32_t>> values(shaderConfig.specializationConstants.begin(),
++														   shaderConfig.specializationConstants.end());
++		optimizer.RegisterPass(spvtools::CreateFlattenDecorationPass());
++		optimizer.RegisterPass(spvtools::CreateSetSpecConstantDefaultValuePass(values));
++		optimizer.RegisterPass(spvtools::CreateFreezeSpecConstantValuePass());
++		optimizer.RegisterPass(spvtools::CreateFoldSpecConstantOpAndCompositePass());
++		spvtools::OptimizerOptions optimizerOptions;
++		optimizerOptions.set_run_validator(false);
++		if (!optimizer.Run(_spirv.data(), _spirv.size(), &specializedSPIRV, optimizerOptions)) {
++			return logError(conversionResult.resultLog, "Failed to specialize SPIR-V before MSL conversion.");
++		}
++		if (shouldLogSPIRV) {
++			conversionResult.resultLog += "Specialized SPIR-V:\n";
++			mvk::logSPIRV(specializedSPIRV, conversionResult.resultLog);
++		}
++#endif
++	}
++
++	unique_ptr<CompilerMSL> pMSLCompiler;
+ 
+ #ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
+ 	try {
+ #endif
+-		pMSLCompiler = new CompilerMSL(_spirv);
++		pMSLCompiler = make_unique<CompilerMSL>(shaderConfig.shouldSpecializeSPIRV ? specializedSPIRV : _spirv);
+ 
+ 		if (shaderConfig.options.hasEntryPoint()) {
+ 			pMSLCompiler->set_entry_point(shaderConfig.options.entryPointName, shaderConfig.options.entryPointStage);
+@@ -354,17 +404,17 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 	} catch (CompilerError& ex) {
+ 		string errMsg("SPIR-V to MSL conversion error: ");
+ 		errMsg += ex.what();
+-		logError(conversionResult.resultLog, errMsg.data());
+         if (shouldLogMSL && pMSLCompiler) {
+ 			auto partialMSL = pMSLCompiler->get_partial_source();
+             logSource(conversionResult.resultLog, partialMSL, "MSL", "Partially converted");
+         }
++		return logError(conversionResult.resultLog, errMsg.data());
+ 	}
+ #endif
+ 
+ 	// Populate the shader conversion results with info from the compilation run,
+ 	// and mark which vertex attributes and resource bindings are used by the shader
+-	populateEntryPoint(pMSLCompiler, shaderConfig.options, conversionResult.resultInfo.entryPoint);
++	populateEntryPoint(pMSLCompiler.get(), shaderConfig.options, conversionResult.resultInfo.entryPoint);
+ 	conversionResult.resultInfo.isRasterizationDisabled = pMSLCompiler && pMSLCompiler->get_is_rasterization_disabled();
+ 	conversionResult.resultInfo.isPositionInvariant = pMSLCompiler && pMSLCompiler->is_position_invariant();
+ 	conversionResult.resultInfo.needsSwizzleBuffer = pMSLCompiler && pMSLCompiler->needs_swizzle_buffer();
+@@ -376,8 +426,8 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 	conversionResult.resultInfo.needsViewRangeBuffer = pMSLCompiler && pMSLCompiler->needs_view_mask_buffer();
+ 	conversionResult.resultInfo.needsDrawId = pMSLCompiler && pMSLCompiler->has_active_builtin(spv::BuiltInDrawIndex, spv::StorageClassInput);
+ 	conversionResult.resultInfo.needsDepthClipStateBuffer = pMSLCompiler && pMSLCompiler->needs_depth_clip_state_buffer();
+-	conversionResult.resultInfo.usesPhysicalStorageBufferAddressesCapability = usesPhysicalStorageBufferAddressesCapability(pMSLCompiler);
+-	populateSpecializationMacros(pMSLCompiler, conversionResult.resultInfo.specializationMacros);
++	conversionResult.resultInfo.usesPhysicalStorageBufferAddressesCapability = usesPhysicalStorageBufferAddressesCapability(pMSLCompiler.get());
++	populateSpecializationMacros(pMSLCompiler.get(), conversionResult.resultInfo.specializationMacros);
+ 
+ 	// When using Metal argument buffers, if the shader is provided with dynamic buffer offsets,
+ 	// then it needs a buffer to hold these dynamic offsets.
+@@ -412,16 +462,16 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 		}
+ 	}
+ 
+-	delete pMSLCompiler;
++	pMSLCompiler.reset();
+ 
+     // To check GLSL conversion
+     if (shouldLogGLSL) {
+-		CompilerGLSL* pGLSLCompiler = nullptr;
++		unique_ptr<CompilerGLSL> pGLSLCompiler;
+ 
+ #ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS
+ 		try {
+ #endif
+-			pGLSLCompiler = new CompilerGLSL(_spirv);
++			pGLSLCompiler = make_unique<CompilerGLSL>(_spirv);
+ 			auto options = pGLSLCompiler->get_common_options();
+ 			options.vulkan_semantics = true;
+ 			options.separate_shader_objects = true;
+@@ -439,10 +489,9 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 			}
+         }
+ #endif
+-		delete pGLSLCompiler;
+ 	}
+ 
+-	return wasConverted;
++	return true;
+ }
+ 
+ // Appends the message text to the result log.
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+index 6163b541b48c..0370129a6278 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+@@ -153,6 +153,8 @@ namespace mvk {
+ 		std::vector<MSLResourceBinding> resourceBindings;
+ 		std::vector<uint32_t> discreteDescriptorSets;
+ 		std::vector<DescriptorBinding> dynamicBufferDescriptors;
++		bool shouldSpecializeSPIRV = false;
++		std::map<uint32_t, std::vector<uint32_t>> specializationConstants;
+ 
+ 		/** Returns whether the pipeline stage being converted supports vertex attributes. */
+ 		bool stageSupportsVertexAttributes() const;
+@@ -298,6 +300,8 @@ namespace mvk {
+ 		/** Returns whether the SPIR-V code has been set. */
+ 		bool hasSPIRV() { return !_spirv.empty(); }
+ 
++		bool needsSPIRVSpecialization() const;
++
+ 		/**
+ 		 * Converts SPIR-V code, set using setSPIRV() to MSL code.
+ 		 *
+-- 
+2.56.0
+

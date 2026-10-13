@@ -1,0 +1,132 @@
+From 639228bdef2188e01e46a54b7ef409cc6f3415f8 Mon Sep 17 00:00:00 2001
+From: Weizhao Ouyang <o451686892@gmail.com>
+Date: Tue, 13 Oct 2026 16:02:52 +0800
+Subject: [PATCH] Fix MSL cooperative matrix arrays and parameter validation
+
+- Preserve array wrappers when mapping cooperative matrix types
+  to Metal simdgroup matrices.
+- Centralize checks for unresolved scope, dimensions and use parameters.
+- Retain subgroup scope and 8x8 dimension restrictions.
+
+Signed-off-by: Weizhao Ouyang <o451686892@gmail.com>
+---
+ spirv_msl.cpp | 82 ++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 45 insertions(+), 37 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 21232ee80ef6..eaddc7de01a2 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -9542,20 +9542,25 @@ void CompilerMSL::validate_cooperative_matrix_type(const SPIRType &type)
+ 	if (comp.basetype != SPIRType::Float && comp.basetype != SPIRType::Half && comp.basetype != SPIRType::BFloat16)
+ 		SPIRV_CROSS_THROW("MSL cooperative matrices only support float16, float32, and bfloat16 component types.");
+ 
++	auto get_parameter = [&](uint32_t id) -> const SPIRConstant & {
++		auto *constant = maybe_get<SPIRConstant>(id);
++		if (!constant || constant->specialization)
++			SPIRV_CROSS_THROW(join("MSL cooperative matrix parameter %", id,
++			                      " must be resolved to a constant before compilation."));
++		return *constant;
++	};
++
+ 	// Only Subgroup scope.
+-	auto &scope = get<SPIRConstant>(type.ext.cooperative.scope_id);
+-	if (scope.specialization)
+-		SPIRV_CROSS_THROW("MSL does not support spec-constant scope for cooperative matrices.");
++	auto &scope = get_parameter(type.ext.cooperative.scope_id);
+ 	if (scope.scalar() != ScopeSubgroup)
+ 		SPIRV_CROSS_THROW("MSL cooperative matrices only support Subgroup scope.");
+ 
+ 	// Only 8x8.
+-	auto &rows = get<SPIRConstant>(type.ext.cooperative.rows_id);
+-	auto &columns = get<SPIRConstant>(type.ext.cooperative.columns_id);
+-	if (rows.specialization || columns.specialization)
+-		SPIRV_CROSS_THROW("MSL does not support spec-constant dimensions for cooperative matrices.");
++	auto &rows = get_parameter(type.ext.cooperative.rows_id);
++	auto &columns = get_parameter(type.ext.cooperative.columns_id);
+ 	if (rows.scalar() != 8 || columns.scalar() != 8)
+ 		SPIRV_CROSS_THROW("MSL cooperative matrices only support 8x8 dimensions.");
++	get_parameter(type.ext.cooperative.use_id);
+ }
+ 
+ // Validates all cooperative matrix types up-front, rather than failing partway through a function.
+@@ -17404,36 +17409,6 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
+ 		return type_name;
+ 	}
+ 
+-	// Cooperative matrix -> Metal simdgroup matrix type
+-	{
+-		const SPIRType *coop_type = &type;
+-		while (coop_type && (is_pointer(*coop_type) || is_array(*coop_type)))
+-			coop_type = maybe_get<SPIRType>(coop_type->parent_type);
+-
+-		if (coop_type && coop_type->op == OpTypeCooperativeMatrixKHR)
+-		{
+-			if (!msl_options.supports_msl_version(3, 1))
+-				SPIRV_CROSS_THROW("Cooperative matrices require MSL 3.1 or later.");
+-
+-			// Only Subgroup scoped 8x8 matrices can be expressed.
+-			validate_cooperative_matrix_type(*coop_type);
+-
+-			// Map component type to simdgroup_*8x8
+-			auto &comp = get<SPIRType>(coop_type->parent_type);
+-			switch (comp.basetype)
+-			{
+-			case SPIRType::Float:
+-				return "simdgroup_float8x8";
+-			case SPIRType::Half:
+-				return "simdgroup_half8x8";
+-			case SPIRType::BFloat16:
+-				return "simdgroup_bfloat8x8";
+-			default:
+-				SPIRV_CROSS_THROW("Unsupported component type for MSL cooperative matrix.");
+-			}
+-		}
+-	}
+-
+ 	switch (type.basetype)
+ 	{
+ 	case SPIRType::Struct:
+@@ -17564,6 +17539,39 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
+ 	if (type.vecsize > 1)
+ 		type_name += to_string(type.vecsize);
+ 
++	// Cooperative matrix -> Metal simdgroup matrix type
++	{
++		const SPIRType *coop_type = &type;
++		while (coop_type && (is_pointer(*coop_type) || is_array(*coop_type)))
++			coop_type = maybe_get<SPIRType>(coop_type->parent_type);
++
++		if (coop_type && coop_type->op == OpTypeCooperativeMatrixKHR)
++		{
++			if (!msl_options.supports_msl_version(3, 1))
++				SPIRV_CROSS_THROW("Cooperative matrices require MSL 3.1 or later.");
++
++			// Only Subgroup scoped 8x8 matrices can be expressed.
++			validate_cooperative_matrix_type(*coop_type);
++
++			// Map component type to simdgroup_*8x8
++			auto &comp = get<SPIRType>(coop_type->parent_type);
++			switch (comp.basetype)
++			{
++			case SPIRType::Float:
++				type_name = "simdgroup_float8x8";
++				break;
++			case SPIRType::Half:
++				type_name = "simdgroup_half8x8";
++				break;
++			case SPIRType::BFloat16:
++				type_name = "simdgroup_bfloat8x8";
++				break;
++			default:
++				SPIRV_CROSS_THROW("Unsupported component type for MSL cooperative matrix.");
++			}
++		}
++	}
++
+ 	if (type.array.empty() || using_builtin_array())
+ 	{
+ 		return type_name;
+-- 
+2.56.0
+

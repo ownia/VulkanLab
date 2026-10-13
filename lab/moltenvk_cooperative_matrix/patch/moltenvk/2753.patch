@@ -1,0 +1,245 @@
+From 118ee818fa87e755f53974266e2b6f40114341d7 Mon Sep 17 00:00:00 2001
+From: Zain Sharief <zain.sharief21@gmail.com>
+Date: Tue, 9 Jun 2026 09:27:31 +0100
+Subject: [PATCH 1/2] Add support for VK_KHR_cooperative_matrix.
+
+---
+ MoltenVK/MoltenVK/API/mvk_deprecated_api.h    |  1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h      |  3 ++
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     | 44 +++++++++++++++++++
+ .../GPUObjects/MVKDeviceFeatureStructs.def    |  1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm   |  1 +
+ MoltenVK/MoltenVK/Layers/MVKExtensions.def    |  1 +
+ MoltenVK/MoltenVK/Vulkan/vulkan.mm            | 16 +++++++
+ 7 files changed, 67 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/API/mvk_deprecated_api.h b/MoltenVK/MoltenVK/API/mvk_deprecated_api.h
+index e630b623a..a12777dbb 100644
+--- a/MoltenVK/MoltenVK/API/mvk_deprecated_api.h
++++ b/MoltenVK/MoltenVK/API/mvk_deprecated_api.h
+@@ -140,6 +140,7 @@ typedef struct {
+ 	VkBool32 quadPermute;							/**< If true, quadgroup permutation functions (vote, ballot, shuffle) are supported in shaders. */
+ 	VkBool32 simdPermute;							/**< If true, SIMD-group permutation functions (vote, ballot, shuffle) are supported in shaders. */
+ 	VkBool32 simdReduction;							/**< If true, SIMD-group reduction functions (arithmetic) are supported in shaders. */
++	VkBool32 cooperativeMatrix;						/**< If true, cooperative matrix (SIMD-group matrix) operations are supported in shaders. */
+     uint32_t minSubgroupSize;			        	/**< The minimum number of threads in a SIMD-group. */
+     VkBool32 textureBarriers;                   	/**< If true, texture barriers are supported within Metal render passes. Deprecated. Will always be false on all platforms. */
+     VkBool32 tileBasedDeferredRendering;        	/**< If true, this device uses tile-based deferred rendering. */
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 8923d23f0..7f04f31ec 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -244,6 +244,9 @@ class MVKPhysicalDevice : public MVKDispatchableVulkanAPIObject {
+ 	/** Populates the specified structure with the tool properties of this device. */
+ 	VkResult getToolProperties(uint32_t* pToolCount, VkPhysicalDeviceToolProperties* pToolProperties);
+ 
++	/** Populates the specified structure with the cooperative matrix properties of this device */
++	VkResult getCooperativeMatrixProperties(uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties); 
++
+ #pragma mark Surfaces
+ 
+ 	/**
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 2e212645a..36a86e615 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -569,6 +569,11 @@
+ 				zeroInitWorkgroupMemFeatures->shaderZeroInitializeWorkgroupMemory = supportedFeats13.shaderZeroInitializeWorkgroupMemory;
+ 				break;
+ 			}
++			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: {
++				auto* coopMatFeatures = (VkPhysicalDeviceCooperativeMatrixFeaturesKHR*)next;
++				coopMatFeatures->cooperativeMatrix = _metalFeatures.cooperativeMatrix;
++				break;
++			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: {
+ 				auto* barycentricFeatures = (VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR*)next;
+ 				barycentricFeatures->fragmentShaderBarycentric = true;
+@@ -1256,6 +1261,11 @@
+ 				shaderIntDotProperties->integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated = supportedProps13.integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated;
+ 				break;
+ 			}
++			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: {
++				auto* coopMatProps = (VkPhysicalDeviceCooperativeMatrixPropertiesKHR*)next;				
++				coopMatProps->cooperativeMatrixSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++				break;
++			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES: {
+ 				auto* divisorProps = (VkPhysicalDeviceVertexAttributeDivisorProperties*)next;
+ 				divisorProps->maxVertexAttribDivisor = supportedProps14.maxVertexAttribDivisor;
+@@ -1874,6 +1884,39 @@
+ 	return VK_SUCCESS;
+ }
+ 
++VkResult MVKPhysicalDevice::getCooperativeMatrixProperties(uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties) {
++	// The exact 8x8 configurations Apple Silicon and SPIRV-Cross support
++	static const VkCooperativeMatrixPropertiesKHR coopMatProps[] = {
++        { VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR, nullptr, 
++          8, 8, 8, 
++          VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, 
++          VK_FALSE, VK_SCOPE_SUBGROUP_KHR },
++        { VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR, nullptr, 
++          8, 8, 8, 
++          VK_COMPONENT_TYPE_FLOAT32_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, 
++          VK_FALSE, VK_SCOPE_SUBGROUP_KHR },
++        { VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR, nullptr, 
++          8, 8, 8, 
++          VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, 
++          VK_FALSE, VK_SCOPE_SUBGROUP_KHR }
++    };
++	uint32_t propCnt = sizeof(coopMatProps) / sizeof(coopMatProps[0]);
++
++	if (!pProperties) {
++		*pPropertyCount = propCnt;
++		return VK_SUCCESS;
++	}
++
++	uint32_t rtCnt = min(*pPropertyCount, propCnt);
++	for (uint32_t i = 0; i < rtCnt; i++) {
++		pProperties[i] = coopMatProps[i];
++	}
++
++	VkResult rslt = (*pPropertyCount >= propCnt) ? VK_SUCCESS : VK_INCOMPLETE;
++	*pPropertyCount = rtCnt;
++	return rslt;	
++}
++
+ 
+ #pragma mark Surfaces
+ 
+@@ -2573,6 +2616,7 @@
+ 		_metalFeatures.samplerClampToBorder = !MVK_TVOS || mvkOSVersionIsAtLeast(16.0);
+ 		_metalFeatures.samplerMirrorClampToEdge = !MVK_TVOS || mvkOSVersionIsAtLeast(16.0);
+ 		_metalFeatures.simdReduction = true;
++		_metalFeatures.cooperativeMatrix = true;
+ 	}
+ 
+ 	if (supportsMTLGPUFamily(Apple10)) {
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+index e82eabf88..9a597ef9f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+@@ -80,6 +80,7 @@ MVK_DEVICE_FEATURE(VariablePointer,                       VARIABLE_POINTER,
+ MVK_DEVICE_FEATURE(VertexAttributeDivisor,                VERTEX_ATTRIBUTE_DIVISOR,                    2)
+ MVK_DEVICE_FEATURE(VulkanMemoryModel,                     VULKAN_MEMORY_MODEL,                         3)
+ MVK_DEVICE_FEATURE(ZeroInitializeWorkgroupMemory,         ZERO_INITIALIZE_WORKGROUP_MEMORY,            1)
++MVK_DEVICE_FEATURE_EXTN(CooperativeMatrix,                COOPERATIVE_MATRIX,                   KHR,   1)
+ MVK_DEVICE_FEATURE_EXTN(FragmentShaderBarycentric,        FRAGMENT_SHADER_BARYCENTRIC,          KHR,   1)
+ MVK_DEVICE_FEATURE_EXTN(Maintenance7,                     MAINTENANCE_7,                        KHR,   1)
+ MVK_DEVICE_FEATURE_EXTN(Maintenance8,                     MAINTENANCE_8,                        KHR,   1)
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
+index c5c4f12f7..38827f067 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
+@@ -768,6 +768,7 @@
+ 	ADD_DVC_EXT_ENTRY_POINT(vkGetSwapchainImagesKHR, KHR_SWAPCHAIN);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkAcquireNextImageKHR, KHR_SWAPCHAIN);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkQueuePresentKHR, KHR_SWAPCHAIN);
++	ADD_DVC_EXT_ENTRY_POINT(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR, KHR_COOPERATIVE_MATRIX);
+ 	ADD_DVC_EXT_VER_OR_EXT_ENTRY_POINT(vkGetDeviceGroupPresentCapabilitiesKHR, KHR_SWAPCHAIN, 1_1, KHR_DEVICE_GROUP);
+ 	ADD_DVC_EXT_VER_OR_EXT_ENTRY_POINT(vkGetDeviceGroupSurfacePresentModesKHR, KHR_SWAPCHAIN, 1_1, KHR_DEVICE_GROUP);
+ 	// n.b. This is an instance function because it operates on physical devices,
+diff --git a/MoltenVK/MoltenVK/Layers/MVKExtensions.def b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+index b838ca0ca..348ab831f 100644
+--- a/MoltenVK/MoltenVK/Layers/MVKExtensions.def
++++ b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+@@ -46,6 +46,7 @@ MVK_EXTENSION(KHR_8bit_storage,                         KHR_8BIT_STORAGE,
+ MVK_EXTENSION(KHR_bind_memory2,                         KHR_BIND_MEMORY_2,                        DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_buffer_device_address,                KHR_BUFFER_DEVICE_ADDRESS,                DEVICE,   13.0,  16.0,  1.0)
+ MVK_EXTENSION(KHR_calibrated_timestamps,                KHR_CALIBRATED_TIMESTAMPS,                DEVICE,   10.15, 14.0,  1.0)
++MVK_EXTENSION(KHR_cooperative_matrix,                   KHR_COOPERATIVE_MATRIX,                   DEVICE,   12.0,  15.0,  1.0)
+ MVK_EXTENSION(KHR_copy_commands2,                       KHR_COPY_COMMANDS_2,                      DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_create_renderpass2,                   KHR_CREATE_RENDERPASS_2,                  DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_dedicated_allocation,                 KHR_DEDICATED_ALLOCATION,                 DEVICE,   10.11,  8.0,  1.0)
+diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+index b15fe5e85..002f3e85f 100644
+--- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
++++ b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+@@ -4330,6 +4330,22 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkExportMetalObjectsEXT(
+ }
+ 
+ 
++#pragma mark -
++#pragma mark VK_KHR_cooperative_matrix extension
++
++MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VkPhysicalDevice                            physicalDevice,
++    uint32_t*                                   pPropertyCount,
++    VkCooperativeMatrixPropertiesKHR*           pProperties) {
++
++    MVKTraceVulkanCallStart();
++	MVKPhysicalDevice* mvkPD = MVKPhysicalDevice::getMVKPhysicalDevice(physicalDevice);
++    VkResult rslt = mvkPD->getCooperativeMatrixProperties(pPropertyCount, pProperties);
++    MVKTraceVulkanCallEnd();
++    return rslt;
++}
++
++
+ #pragma mark -
+ #pragma mark VK_EXT_private_data extension
+ 
+
+From 44653bdda2a711d0d770caad51b9231bb0ca4ddd Mon Sep 17 00:00:00 2001
+From: Zain Sharief <zain.sharief21@gmail.com>
+Date: Tue, 9 Jun 2026 10:50:56 +0100
+Subject: [PATCH 2/2] Move cooperativeMatrix to end of struct to preserve ABI
+
+---
+ MoltenVK/MoltenVK/API/mvk_deprecated_api.h  | 2 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h    | 2 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/API/mvk_deprecated_api.h b/MoltenVK/MoltenVK/API/mvk_deprecated_api.h
+index a12777dbb..8ad55e623 100644
+--- a/MoltenVK/MoltenVK/API/mvk_deprecated_api.h
++++ b/MoltenVK/MoltenVK/API/mvk_deprecated_api.h
+@@ -140,7 +140,6 @@ typedef struct {
+ 	VkBool32 quadPermute;							/**< If true, quadgroup permutation functions (vote, ballot, shuffle) are supported in shaders. */
+ 	VkBool32 simdPermute;							/**< If true, SIMD-group permutation functions (vote, ballot, shuffle) are supported in shaders. */
+ 	VkBool32 simdReduction;							/**< If true, SIMD-group reduction functions (arithmetic) are supported in shaders. */
+-	VkBool32 cooperativeMatrix;						/**< If true, cooperative matrix (SIMD-group matrix) operations are supported in shaders. */
+     uint32_t minSubgroupSize;			        	/**< The minimum number of threads in a SIMD-group. */
+     VkBool32 textureBarriers;                   	/**< If true, texture barriers are supported within Metal render passes. Deprecated. Will always be false on all platforms. */
+     VkBool32 tileBasedDeferredRendering;        	/**< If true, this device uses tile-based deferred rendering. */
+@@ -165,6 +164,7 @@ typedef struct {
+     VkSampleCountFlags supportedSamplePosCounts;    /**< A bitmask identifying the sample counts for which the device supports sample positions. */
+     VkBool32 depthBoundsTest;                       /**< If true, depth bounds test is supported. */
+ 	VkDeviceSize mtlConstantBufferAlignment;		/**< Minimum Metal constant buffer offset alignment (in bytes). */
++	VkBool32 cooperativeMatrix;						/**< If true, cooperative matrix (SIMD-group matrix) operations are supported in shaders. */
+ } MVKPhysicalDeviceMetalFeatures;
+ 
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 7f04f31ec..75f5a971e 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -244,7 +244,7 @@ class MVKPhysicalDevice : public MVKDispatchableVulkanAPIObject {
+ 	/** Populates the specified structure with the tool properties of this device. */
+ 	VkResult getToolProperties(uint32_t* pToolCount, VkPhysicalDeviceToolProperties* pToolProperties);
+ 
+-	/** Populates the specified structure with the cooperative matrix properties of this device */
++	/** Populates the specified structure with the cooperative matrix properties of this device. */
+ 	VkResult getCooperativeMatrixProperties(uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties); 
+ 
+ #pragma mark Surfaces
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
+index 38827f067..883d28b2f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
+@@ -758,6 +758,7 @@
+ 	// Device extension functions.
+ 	ADD_DVC_EXT_ENTRY_POINT(vkGetCalibratedTimestampsKHR, KHR_CALIBRATED_TIMESTAMPS);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkGetPhysicalDeviceCalibrateableTimeDomainsKHR, KHR_CALIBRATED_TIMESTAMPS);
++	ADD_DVC_EXT_ENTRY_POINT(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR, KHR_COOPERATIVE_MATRIX);
+     ADD_DVC_EXT_ENTRY_POINT(vkCreateDeferredOperationKHR, KHR_DEFERRED_HOST_OPERATIONS);
+     ADD_DVC_EXT_ENTRY_POINT(vkDeferredOperationJoinKHR, KHR_DEFERRED_HOST_OPERATIONS);
+     ADD_DVC_EXT_ENTRY_POINT(vkDestroyDeferredOperationKHR, KHR_DEFERRED_HOST_OPERATIONS);
+@@ -768,7 +769,6 @@
+ 	ADD_DVC_EXT_ENTRY_POINT(vkGetSwapchainImagesKHR, KHR_SWAPCHAIN);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkAcquireNextImageKHR, KHR_SWAPCHAIN);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkQueuePresentKHR, KHR_SWAPCHAIN);
+-	ADD_DVC_EXT_ENTRY_POINT(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR, KHR_COOPERATIVE_MATRIX);
+ 	ADD_DVC_EXT_VER_OR_EXT_ENTRY_POINT(vkGetDeviceGroupPresentCapabilitiesKHR, KHR_SWAPCHAIN, 1_1, KHR_DEVICE_GROUP);
+ 	ADD_DVC_EXT_VER_OR_EXT_ENTRY_POINT(vkGetDeviceGroupSurfacePresentModesKHR, KHR_SWAPCHAIN, 1_1, KHR_DEVICE_GROUP);
+ 	// n.b. This is an instance function because it operates on physical devices,
