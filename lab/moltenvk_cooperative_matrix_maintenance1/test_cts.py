@@ -1,3 +1,5 @@
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 from pathlib import Path
 import runpy
@@ -48,6 +50,80 @@ class CtsWorkflowTests(unittest.TestCase):
     def test_cts_exit_code_is_preserved(self):
         self.assertEqual(cts.summarize([], ["case"], 7)["exit_code"], 7)
         self.assertEqual(cts.summarize([], ["case"], -11)["exit_code"], 139)
+
+    def test_color_auto_requires_supported_terminal(self):
+        stream = io.StringIO()
+        with patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=True):
+            self.assertEqual(cts.colorize("Pass", "green", stream=stream), "Pass")
+            with patch.object(stream, "isatty", return_value=True):
+                self.assertEqual(cts.colorize("Pass", "green", stream=stream), "\033[32mPass\033[0m")
+                with patch.dict("os.environ", {"NO_COLOR": ""}):
+                    self.assertEqual(cts.colorize("Pass", "green", stream=stream), "Pass")
+                with patch.dict("os.environ", {"TERM": "dumb"}):
+                    self.assertEqual(cts.colorize("Pass", "green", stream=stream), "Pass")
+
+    def test_color_cli_overrides_automatic_detection(self):
+        stream = io.StringIO()
+        self.assertEqual(cts.parse_args([]).color, "auto")
+        with patch.dict("os.environ", {"NO_COLOR": "1", "TERM": "dumb"}):
+            arguments = cts.parse_args(["--color", "always"])
+            self.assertEqual(cts.colorize("Fail", "red", arguments.color, stream), "\033[31mFail\033[0m")
+        with patch.object(stream, "isatty", return_value=True):
+            self.assertEqual(cts.colorize("Fail", "red", "never", stream), "Fail")
+
+    def test_result_display_colors_do_not_change_summary(self):
+        results = [{"case": status, "status": status, "detail": "result detail"}
+                   for status in ("Pass", "Fail", "NotSupported", "QualityWarning")]
+        summary = cts.summarize(results, [result["case"] for result in results], 1)
+        original = json.dumps(summary, sort_keys=True)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            cts.print_results(summary, results, "always")
+        text = output.getvalue()
+        self.assertIn("\033[32m  Pass      1\033[0m", text)
+        self.assertIn("\033[31m  Fail      1\033[0m", text)
+        self.assertIn("\033[33m  Skip      1\033[0m", text)
+        self.assertIn("\033[33m  Warnings  1\033[0m", text)
+        self.assertIn("\033[31mFail\033[0m: Fail\n    result detail", text)
+        self.assertEqual(json.dumps(summary, sort_keys=True), original)
+        with redirect_stdout(io.StringIO()) as plain:
+            cts.print_results(summary, results, "never")
+        self.assertNotIn("\033[", plain.getvalue())
+
+    def test_incomplete_results_are_highlighted(self):
+        summary = cts.summarize([], ["missing"], 0)
+        with redirect_stdout(io.StringIO()) as output:
+            cts.print_results(summary, [], "always")
+        self.assertIn("\033[31mIncomplete or invalid result set", output.getvalue())
+
+    def test_max_failures_cli(self):
+        self.assertEqual(cts.parse_args([]).max_failures, 10)
+        for limit in (1, 25, 0):
+            with self.subTest(limit=limit):
+                self.assertEqual(cts.parse_args(["--max-failures", str(limit)]).max_failures, limit)
+        for invalid in ("-1", "many"):
+            with self.subTest(invalid=invalid), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    cts.parse_args(["--max-failures", invalid])
+                self.assertEqual(error.exception.code, 2)
+
+    def test_failure_display_limit_preserves_all_results(self):
+        results = [{"case": f"case{index:02d}", "status": "Fail", "detail": "result detail"}
+                   for index in range(12)]
+        summary = cts.summarize(results, [result["case"] for result in results], 1)
+        original = json.dumps([summary, results], sort_keys=True)
+        for options, expected in (({}, 10), ({"max_failures": 3}, 3),
+                                  ({"max_failures": 25}, 12), ({"max_failures": 0}, 12)):
+            with self.subTest(options=options), redirect_stdout(io.StringIO()) as output:
+                cts.print_results(summary, results, "never", **options)
+            text = output.getvalue()
+            self.assertIn(f"Failures ({expected} of 12)", text)
+            self.assertIn("  Fail      12", text)
+            self.assertEqual(text.count("  Fail: "), expected)
+            self.assertIn(f"case{expected - 1:02d}", text)
+            if expected < len(results):
+                self.assertNotIn(f"case{expected:02d}", text)
+            self.assertEqual(json.dumps([summary, results], sort_keys=True), original)
 
     def test_configuration_and_baseline_cli(self):
         arguments = cts.parse_args(["--debug", "--group", "api", "--group", "properties", "--experimental", "0"])

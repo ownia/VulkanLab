@@ -29,6 +29,39 @@ CORE_OPERATIONS = (
     "convert_base_dst_khr_*", "multicomponent",
 )
 GOOD_STATUSES = {"Pass", "NotSupported", "QualityWarning", "CompatibilityWarning"}
+COLORS = {"bold": "1", "green": "32", "red": "31", "yellow": "33"}
+
+
+def colorize(text, style, mode="auto", stream=None):
+    stream = sys.stdout if stream is None else stream
+    enabled = mode == "always" or (
+        mode == "auto" and stream.isatty()
+        and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+    )
+    return f"\033[{COLORS[style]}m{text}\033[0m" if enabled else text
+
+
+def print_results(summary, results, color, max_failures=10):
+    print(colorize("\nCTS results", "bold", color))
+    print(f"  Total     {summary['total']}/{summary['selected']}")
+    for key, label, style in (
+        ("pass", "Pass", "green"), ("fail", "Fail", "red"),
+        ("skip", "Skip", "yellow"), ("warnings", "Warnings", "yellow"),
+    ):
+        line = f"  {label:<9} {summary[key]}"
+        print(colorize(line, style, color) if summary[key] else line)
+    exits = f"  Exit      CTS {summary['cts_exit_code']}, runner {summary['exit_code']}"
+    print(colorize(exits, "red", color) if summary["exit_code"] else exits)
+
+    failures = [result for result in results if result["status"] not in GOOD_STATUSES]
+    if failures:
+        displayed = failures[:max_failures] if max_failures else failures
+        print(colorize(f"\nFailures ({len(displayed)} of {len(failures)})", "red", color))
+        for result in displayed:
+            status = colorize(result["status"], "red", color)
+            print(f"  {status}: {result['case']}\n    {result['detail']}")
+    if summary["missing"] or summary["unexpected"] or summary["duplicates"] or summary.get("parse_error"):
+        print(colorize("Incomplete or invalid result set; see summary.json and console.log", "red", color))
 
 
 def relevant_case(case):
@@ -137,11 +170,17 @@ def parse_args(argv=None):
                         help="driver opt-in (default: environment value or 1); 0 tests baseline gating")
     parser.add_argument("--list-only", action="store_true", help="expand and validate selection without executing tests")
     parser.add_argument("--max-cases", type=int, help="execution ceiling (default: 256, no default ceiling with --full)")
+    parser.add_argument("--max-failures", type=int, default=10, metavar="N",
+                        help="maximum failure details to print (default: 10; 0 shows all)")
+    parser.add_argument("--color", choices=["auto", "always", "never"], default="auto",
+                        help="terminal colors (default: auto; honors NO_COLOR)")
     arguments = parser.parse_args(argv)
     if arguments.experimental not in {"0", "1"}:
         parser.error("VULKANLAB_EXPERIMENTAL_CMM1 must be 0 or 1")
     if arguments.max_cases is not None and arguments.max_cases < 1:
         parser.error("--max-cases must be positive")
+    if arguments.max_failures < 0:
+        parser.error("--max-failures must be nonnegative")
     return arguments
 
 
@@ -231,11 +270,7 @@ def run(arguments):
     write_json(output / "summary.json", summary)
     message = "Total {total}/{selected}: pass={pass}, fail={fail}, skip={skip}, warnings={warnings}; CTS exit={cts_exit_code}, wrapper exit={exit_code}".format(**summary)
     (output / "summary.txt").write_text(message + "\n", encoding="utf-8")
-    print(message)
-    for result in [result for result in results if result["status"] not in GOOD_STATUSES][:10]:
-        print(result["status"] + ": " + result["case"] + ": " + result["detail"])
-    if summary["missing"] or summary["unexpected"] or summary["duplicates"] or parse_error:
-        print("Incomplete or invalid result set; see summary.json and console.log")
+    print_results(summary, results, arguments.color, arguments.max_failures)
     return summary["exit_code"]
 
 
@@ -244,7 +279,7 @@ def main(argv=None):
     try:
         return run(arguments)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print("CTS: " + str(error), file=sys.stderr)
+        print(colorize("CTS: " + str(error), "red", arguments.color, sys.stderr), file=sys.stderr)
         return 2
 
 
