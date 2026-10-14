@@ -1,14 +1,15 @@
 #!/bin/sh
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+sh "$ROOT/../../scripts/prepare_dependencies.sh" "$ROOT"
 BUILD_DIR=${BUILD_DIR:-"$ROOT/build"}
 case "$BUILD_DIR" in
     /*) ;;
     *) BUILD_DIR="$PWD/$BUILD_DIR" ;;
 esac
 TOOLS_BUILD_DIR="$BUILD_DIR/tools"
-THIRD_PARTY_DIR=$(CDPATH= cd -- "$ROOT/../../third_party" && pwd)
+THIRD_PARTY_DIR=$(CDPATH='' cd -- "$ROOT/../../third_party" && pwd)
 MESA_DIR=${MESA_DIR:-"$THIRD_PARTY_DIR/mesa"}
 MESA_BUILD_DIR="$BUILD_DIR/mesa"
 JOBS=${JOBS:-4}

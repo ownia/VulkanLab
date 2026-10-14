@@ -1,9 +1,10 @@
 #!/bin/sh
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$ROOT/../moltenvk_cooperative_matrix/config.sh"
-THIRD_PARTY_DIR=$(CDPATH= cd -- "$ROOT/../../third_party" && pwd)
+sh "$ROOT/../../scripts/prepare_dependencies.sh" "$ROOT"
+THIRD_PARTY_DIR=$(CDPATH='' cd -- "$ROOT/../../third_party" && pwd)
 VULKAN_INCLUDE_DIR="$THIRD_PARTY_DIR/Vulkan-Headers/include"
 SPIRV_CROSS_DIR="$BUILD_DIR/src/SPIRV-Cross"
 
@@ -41,7 +42,8 @@ apply_patches() {
     mkdir -p "$patch_dir/mail"
     git mailsplit -o"$patch_dir/mail" "$@" >/dev/null
     for mail in "$patch_dir"/mail/*; do
-        git mailinfo /dev/null "$patch_dir/$(basename -- "$mail").diff" < "$mail" >/dev/null
+        patch_file="$patch_dir/$(basename -- "$mail").diff"
+        git mailinfo /dev/null "$patch_file" < "$mail" >/dev/null
     done
 
     set --
