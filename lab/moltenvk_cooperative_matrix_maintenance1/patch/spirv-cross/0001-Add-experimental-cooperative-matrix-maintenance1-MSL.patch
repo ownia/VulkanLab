@@ -1,0 +1,196 @@
+From 7daa8db13f2260348d33bc8060e3602fb0e923e4 Mon Sep 17 00:00:00 2001
+From: Weizhao Ouyang <o451686892@gmail.com>
+Date: Wed, 14 Oct 2026 14:18:32 +0800
+Subject: [PATCH] Add experimental cooperative matrix maintenance1 MSL
+
+Layer experimental maintenance1 callback, captured-parameter,
+matrix-extra, and reduction lowering on the original MSL cooperative
+matrix fixes.
+
+Signed-off-by: Weizhao Ouyang <o451686892@gmail.com>
+---
+ spirv_cross.cpp | 12 ++++---
+ spirv_glsl.cpp  |  5 +--
+ spirv_msl.cpp   | 85 +++++++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 92 insertions(+), 10 deletions(-)
+
+diff --git a/spirv_cross.cpp b/spirv_cross.cpp
+index c0b886492655..dcda46cd42f7 100644
+--- a/spirv_cross.cpp
++++ b/spirv_cross.cpp
+@@ -2018,9 +2018,11 @@ bool Compiler::traverse_all_reachable_opcodes(const SPIRBlock &block, OpcodeHand
+ 				handler.result_types[result_id] = result_type;
+ 		}
+ 
+-		if (op == OpFunctionCall)
++		if (op == OpFunctionCall || op == OpCooperativeMatrixReduceNV || op == OpCooperativeMatrixPerElementOpNV)
+ 		{
+-			auto &func = get<SPIRFunction>(ops[2]);
++			uint32_t function_id = op == OpFunctionCall ? ops[2] :
++				(op == OpCooperativeMatrixReduceNV ? ops[4] : ops[3]);
++			auto &func = get<SPIRFunction>(function_id);
+ 			if (handler.follow_function_call(func))
+ 			{
+ 				if (handler.enable_result_types)
+@@ -2028,11 +2030,11 @@ bool Compiler::traverse_all_reachable_opcodes(const SPIRBlock &block, OpcodeHand
+ 						if (!arg.alias_global_variable)
+ 							handler.result_types[arg.id] = arg.type;
+ 
+-				if (!handler.begin_function_scope(ops, i.length))
++				if (op == OpFunctionCall && !handler.begin_function_scope(ops, i.length))
+ 					return false;
+-				if (!traverse_all_reachable_opcodes(get<SPIRFunction>(ops[2]), handler))
++				if (!traverse_all_reachable_opcodes(func, handler))
+ 					return false;
+-				if (!handler.end_function_scope(ops, i.length))
++				if (op == OpFunctionCall && !handler.end_function_scope(ops, i.length))
+ 					return false;
+ 
+ 				handler.rearm_current_block(block);
+diff --git a/spirv_glsl.cpp b/spirv_glsl.cpp
+index c8284a210b40..f25593daa56e 100644
+--- a/spirv_glsl.cpp
++++ b/spirv_glsl.cpp
+@@ -18170,10 +18170,11 @@ void CompilerGLSL::emit_function(SPIRFunction &func, const Bitset &return_flags)
+ 			auto ops = stream(i);
+ 			auto op = static_cast<Op>(i.op);
+ 
+-			if (op == OpFunctionCall)
++			if (op == OpFunctionCall || op == OpCooperativeMatrixReduceNV || op == OpCooperativeMatrixPerElementOpNV)
+ 			{
+ 				// Recursively emit functions which are called.
+-				uint32_t id = ops[2];
++				uint32_t id = op == OpFunctionCall ? ops[2] :
++					(op == OpCooperativeMatrixReduceNV ? ops[4] : ops[3]);
+ 
+ 				emit_function(get<SPIRFunction>(id), ir.meta[ops[1]].decoration.decoration_flags);
+ 			}
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index eaddc7de01a2..7bea10f1b5e8 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2099,9 +2099,13 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+ 			}
+ 
+ 			case OpFunctionCall:
++			case OpCooperativeMatrixReduceNV:
++			case OpCooperativeMatrixPerElementOpNV:
+ 			{
+ 				// First see if any of the function call args are globals
+-				for (uint32_t arg_idx = 3; arg_idx < i.length; arg_idx++)
++				uint32_t first_arg = op == OpFunctionCall ? 3 :
++					(op == OpCooperativeMatrixReduceNV ? i.length : 4);
++				for (uint32_t arg_idx = first_arg; arg_idx < i.length; arg_idx++)
+ 				{
+ 					uint32_t arg_id = ops[arg_idx];
+ 					if (global_var_ids.find(arg_id) != global_var_ids.end())
+@@ -2109,7 +2113,8 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+ 				}
+ 
+ 				// Then recurse into the function itself to extract globals used internally in the function
+-				uint32_t inner_func_id = ops[2];
++				uint32_t inner_func_id = op == OpFunctionCall ? ops[2] :
++					(op == OpCooperativeMatrixReduceNV ? ops[4] : ops[3]);
+ 				std::set<uint32_t> inner_func_args;
+ 				extract_global_variables_from_function(inner_func_id, inner_func_args, global_var_ids,
+ 				                                       processed_func_ids);
+@@ -9754,7 +9759,7 @@ bool CompilerMSL::maybe_emit_cooperative_matrix_op(const Instruction &instructio
+ 	}
+ 
+ 	default:
+-		SPIRV_CROSS_THROW("Unsupported operation on cooperative matrix in MSL backend.");
++		SPIRV_CROSS_THROW(join("Unsupported operation on cooperative matrix in MSL backend: ", uint32_t(opcode)));
+ 	}
+ 
+ 	return true;
+@@ -11041,6 +11046,74 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		break;
+ 	}
+ 
++	case OpCooperativeMatrixPerElementOpNV:
++	{
++		auto &callee = get<SPIRFunction>(ops[3]);
++		emit_uninitialized_temporary_expression(ops[0], ops[1]);
++		auto lane = to_expression(builtin_subgroup_invocation_id_id);
++		for (uint32_t component = 0; component < 2; ++component)
++		{
++			SmallVector<string> arguments;
++			arguments.push_back(join("((", lane, " / 2u) % 4u + (", lane, " / 16u) * 4u)"));
++			arguments.push_back(join("((", lane, " % 2u) * 2u + ((", lane, " / 8u) % 2u) * 4u + ", component, "u)"));
++			arguments.push_back(to_cooperative_matrix_component(ops[2], join(component, "u")));
++			for (uint32_t operand = 4; operand < instruction.length; ++operand)
++				arguments.push_back(to_cooperative_matrix_component(ops[operand], join(component, "u")));
++			append_global_func_args(callee, uint32_t(arguments.size()), arguments);
++			statement(to_expression(ops[1]), ".thread_elements()[", component, "] = ",
++				to_name(ops[3]), "(", merge(arguments), ");");
++		}
++		register_read(ops[1], ops[2], false);
++		for (uint32_t operand = 4; operand < instruction.length; ++operand)
++			register_read(ops[1], ops[operand], false);
++		break;
++	}
++
++	case OpCooperativeMatrixReduceNV:
++	{
++		uint32_t mask = ops[3];
++		if (mask != 1 && mask != 2 && mask != 3)
++			SPIRV_CROSS_THROW("Lab maintenance1 supports broadcast row, column, and full 8x8 reductions only; reduced-shape/2x2 outputs are not implemented.");
++		auto &callee = get<SPIRFunction>(ops[4]);
++		auto lane = to_expression(builtin_subgroup_invocation_id_id);
++		auto &component_type = get<SPIRType>(get<SPIRType>(ops[0]).parent_type);
++		emit_uninitialized_temporary_expression(ops[0], ops[1]);
++		for (uint32_t component = 0; component < 2; ++component)
++		{
++			string accumulator = join("spvReduce", ops[1], "_", component);
++			statement(type_to_glsl(component_type), " ", accumulator, " = ",
++				to_cooperative_matrix_component(ops[2], join(component, "u")), ";");
++			uint32_t count = mask == 3 ? 64 : 8;
++			for (uint32_t offset = 1; offset < count; ++offset)
++			{
++				string source_lane, source_component;
++				if (mask == 1)
++				{
++					source_lane = join("(", lane, " ^ ", ((offset / 2) % 2) + (offset / 4) * 8, "u)");
++					source_component = join(component ^ (offset % 2), "u");
++				}
++				else if (mask == 2)
++				{
++					source_lane = join("(", lane, " ^ ", (offset % 4) * 2 + (offset / 4) * 16, "u)");
++					source_component = join(component, "u");
++				}
++				else
++				{
++					source_lane = join("(", lane, " ^ ", offset / 2, "u)");
++					source_component = join(component ^ (offset % 2), "u");
++				}
++				SmallVector<string> arguments;
++				arguments.push_back(accumulator);
++				arguments.push_back(join("simd_shuffle(", to_cooperative_matrix_component(ops[2], source_component), ", ", source_lane, ")"));
++				append_global_func_args(callee, 2, arguments);
++				statement(accumulator, " = ", to_name(ops[4]), "(", merge(arguments), ");");
++			}
++			statement(to_expression(ops[1]), ".thread_elements()[", component, "] = ", accumulator, ";");
++		}
++		register_read(ops[1], ops[2], false);
++		break;
++	}
++
+ 	case OpCooperativeMatrixLoadKHR:
+ 	{
+ 		uint32_t result_type = ops[0];
+@@ -19613,6 +19686,12 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+ 			needs_helper_invocation = true;
+ 		break;
+ 
++	case OpCooperativeMatrixReduceNV:
++	case OpCooperativeMatrixPerElementOpNV:
++		needs_subgroup_invocation_id = true;
++		uses_cooperative_matrix = true;
++		break;
++
+ 	case OpCooperativeMatrixLoadKHR:
+ 	case OpCooperativeMatrixMulAddKHR:
+ 	case OpCooperativeMatrixLengthKHR:
+-- 
+2.56.0
+

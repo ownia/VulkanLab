@@ -1,0 +1,163 @@
+From 31d353ae11dbb84f86a4da60bea0034bde093088 Mon Sep 17 00:00:00 2001
+From: Weizhao Ouyang <o451686892@gmail.com>
+Date: Wed, 14 Oct 2026 14:16:14 +0800
+Subject: [PATCH] Add experimental cooperative matrix maintenance1
+
+Layer opt-in maintenance1 feature and query plumbing on the original KHR
+cooperative matrix patches.
+
+Signed-off-by: Weizhao Ouyang <o451686892@gmail.com>
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h      |  1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     | 29 +++++++++++++++++++
+ .../GPUObjects/MVKDeviceFeatureStructs.def    |  1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm   |  1 +
+ MoltenVK/MoltenVK/Layers/MVKExtensions.def    |  1 +
+ MoltenVK/MoltenVK/Layers/MVKExtensions.mm     |  5 ++++
+ MoltenVK/MoltenVK/Vulkan/vulkan.mm            | 12 ++++++++
+ 7 files changed, 50 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 8ce08f20f590..6cf8fd214f4f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -259,6 +259,7 @@ public:
+ 
+ 	/** Populates the specified structure with the cooperative matrix properties of this device. */
+ 	VkResult getCooperativeMatrixProperties(uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties); 
++	VkResult getCooperativeMatrixProperties2(const VkPhysicalDeviceCooperativeMatrixInfo2EXT* pInfo, uint32_t* pPropertyCount, VkCooperativeMatrixProperties2EXT* pProperties);
+ 
+ #pragma mark Surfaces
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 262e6985c457..f3f0dd5890ff 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -577,6 +577,15 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
+ 				coopMatFeatures->cooperativeMatrix = _metalFeatures.cooperativeMatrix;
+ 				break;
+ 			}
++			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_MAINTENANCE_1_FEATURES_EXT: {
++				auto* features = (VkPhysicalDeviceCooperativeMatrixMaintenance1FeaturesEXT*)next;
++				features->cooperativeMatrixProperties2 = _metalFeatures.cooperativeMatrix;
++				features->cooperativeMatrixReductions = _metalFeatures.cooperativeMatrix;
++				features->cooperativeMatrixPerElementOperations = _metalFeatures.cooperativeMatrix;
++				features->cooperativeMatrixConversions = VK_FALSE;
++				features->cooperativeMatrixGetCoordinate = VK_FALSE;
++				break;
++			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: {
+ 				auto* barycentricFeatures = (VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR*)next;
+ 				barycentricFeatures->fragmentShaderBarycentric = true;
+@@ -1958,6 +1967,26 @@ VkResult MVKPhysicalDevice::getCooperativeMatrixProperties(uint32_t* pPropertyCo
+ }
+ 
+ 
++VkResult MVKPhysicalDevice::getCooperativeMatrixProperties2(const VkPhysicalDeviceCooperativeMatrixInfo2EXT* pInfo,
++														  uint32_t* pPropertyCount,
++														  VkCooperativeMatrixProperties2EXT* pProperties) {
++	uint32_t count = _metalFeatures.cooperativeMatrix && pInfo->scope == VK_SCOPE_SUBGROUP_KHR &&
++		(!pInfo->subgroupSize || pInfo->subgroupSize == 32) && !pInfo->flags ? 1 : 0;
++	if (!pProperties) {
++		*pPropertyCount = count;
++		return VK_SUCCESS;
++	}
++	uint32_t written = min(*pPropertyCount, count);
++	if (written) {
++		auto& properties = pProperties[0];
++		properties.MGranularity = properties.NGranularity = properties.KGranularity = 8;
++		properties.AType = properties.BType = properties.CType = properties.ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR;
++	}
++	VkResult result = *pPropertyCount < count ? VK_INCOMPLETE : VK_SUCCESS;
++	*pPropertyCount = written;
++	return result;
++}
++
+ #pragma mark Surfaces
+ 
+ VkResult MVKPhysicalDevice::getSurfaceSupport(uint32_t queueFamilyIndex,
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+index 9f4872561c20..b545f34dae6d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+@@ -81,6 +81,7 @@ MVK_DEVICE_FEATURE(VertexAttributeDivisor,                VERTEX_ATTRIBUTE_DIVIS
+ MVK_DEVICE_FEATURE(VulkanMemoryModel,                     VULKAN_MEMORY_MODEL,                         3)
+ MVK_DEVICE_FEATURE(ZeroInitializeWorkgroupMemory,         ZERO_INITIALIZE_WORKGROUP_MEMORY,            1)
+ MVK_DEVICE_FEATURE_EXTN(CooperativeMatrix,                COOPERATIVE_MATRIX,                   KHR,   1)
++MVK_DEVICE_FEATURE_EXTN(CooperativeMatrixMaintenance1,    COOPERATIVE_MATRIX_MAINTENANCE_1,     EXT,   5)
+ MVK_DEVICE_FEATURE_EXTN(FragmentShaderBarycentric,        FRAGMENT_SHADER_BARYCENTRIC,          KHR,   1)
+ MVK_DEVICE_FEATURE_EXTN(Maintenance7,                     MAINTENANCE_7,                        KHR,   1)
+ MVK_DEVICE_FEATURE_EXTN(Maintenance8,                     MAINTENANCE_8,                        KHR,   1)
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
+index 34d7a5421823..9fc2b413a2d0 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
+@@ -760,6 +760,7 @@ void MVKInstance::initProcAddrs() {
+ 	ADD_DVC_EXT_ENTRY_POINT(vkGetCalibratedTimestampsKHR, KHR_CALIBRATED_TIMESTAMPS);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkGetPhysicalDeviceCalibrateableTimeDomainsKHR, KHR_CALIBRATED_TIMESTAMPS);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR, KHR_COOPERATIVE_MATRIX);
++	ADD_DVC_EXT_ENTRY_POINT(vkGetPhysicalDeviceCooperativeMatrixProperties2EXT, EXT_COOPERATIVE_MATRIX_MAINTENANCE_1);
+     ADD_DVC_EXT_ENTRY_POINT(vkCreateDeferredOperationKHR, KHR_DEFERRED_HOST_OPERATIONS);
+     ADD_DVC_EXT_ENTRY_POINT(vkDeferredOperationJoinKHR, KHR_DEFERRED_HOST_OPERATIONS);
+     ADD_DVC_EXT_ENTRY_POINT(vkDestroyDeferredOperationKHR, KHR_DEFERRED_HOST_OPERATIONS);
+diff --git a/MoltenVK/MoltenVK/Layers/MVKExtensions.def b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+index 5439f7b7c35c..10adbddffb6d 100644
+--- a/MoltenVK/MoltenVK/Layers/MVKExtensions.def
++++ b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+@@ -47,6 +47,7 @@ MVK_EXTENSION(KHR_bind_memory2,                         KHR_BIND_MEMORY_2,
+ MVK_EXTENSION(KHR_buffer_device_address,                KHR_BUFFER_DEVICE_ADDRESS,                DEVICE,   13.0,  16.0,  1.0)
+ MVK_EXTENSION(KHR_calibrated_timestamps,                KHR_CALIBRATED_TIMESTAMPS,                DEVICE,   10.15, 14.0,  1.0)
+ MVK_EXTENSION(KHR_cooperative_matrix,                   KHR_COOPERATIVE_MATRIX,                   DEVICE,   12.0,  15.0,  1.0)
++MVK_EXTENSION(EXT_cooperative_matrix_maintenance1,       EXT_COOPERATIVE_MATRIX_MAINTENANCE_1,     DEVICE,   12.0,  15.0,  1.0)
+ MVK_EXTENSION(KHR_copy_commands2,                       KHR_COPY_COMMANDS_2,                      DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_create_renderpass2,                   KHR_CREATE_RENDERPASS_2,                  DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_dedicated_allocation,                 KHR_DEDICATED_ALLOCATION,                 DEVICE,   10.11,  8.0,  1.0)
+diff --git a/MoltenVK/MoltenVK/Layers/MVKExtensions.mm b/MoltenVK/MoltenVK/Layers/MVKExtensions.mm
+index 273a58a5f985..2907568a775f 100644
+--- a/MoltenVK/MoltenVK/Layers/MVKExtensions.mm
++++ b/MoltenVK/MoltenVK/Layers/MVKExtensions.mm
+@@ -20,6 +20,7 @@
+ #include "MVKFoundation.h"
+ #include "MVKOSExtensions.h"
+ #include "mvk_deprecated_api.h"
++#include <cstdlib>
+ #include <vulkan/vulkan_ios.h>
+ #include <vulkan/vulkan_macos.h>
+ 
+@@ -45,6 +46,10 @@ static VkExtensionProperties kVkExtProps_ ##EXT = mvkMakeExtProps(VK_ ##EXT ##_E
+ 
+ // Returns whether the specified properties are valid for this platform
+ static bool mvkIsSupportedOnPlatform(VkExtensionProperties* pProperties) {
++	if (pProperties == &kVkExtProps_EXT_COOPERATIVE_MATRIX_MAINTENANCE_1) {
++		const char* experimental = std::getenv("VULKANLAB_EXPERIMENTAL_CMM1");
++		if (!experimental || strcmp(experimental, "1") != 0) { return false; }
++	}
+ #define MVK_EXTENSION_MIN_OS(EXT, MAC, IOS, XROS) \
+ 	if (pProperties == &kVkExtProps_##EXT) { return mvkOSVersionIsAtLeast(MAC, IOS, XROS); }
+ 
+diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+index 6037f9dfd700..1f45af73ce1a 100644
+--- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
++++ b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+@@ -4387,6 +4387,18 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceCooperativeMatrixProperties
+ 
+ 
+ #pragma mark -
++MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetPhysicalDeviceCooperativeMatrixProperties2EXT(
++	VkPhysicalDevice physicalDevice,
++	const VkPhysicalDeviceCooperativeMatrixInfo2EXT* pCooperativeMatrixInfo,
++	uint32_t* pPropertyCount,
++	VkCooperativeMatrixProperties2EXT* pProperties) {
++	MVKTraceVulkanCallStart();
++	auto* device = MVKPhysicalDevice::getMVKPhysicalDevice(physicalDevice);
++	VkResult result = device->getCooperativeMatrixProperties2(pCooperativeMatrixInfo, pPropertyCount, pProperties);
++	MVKTraceVulkanCallEnd();
++	return result;
++}
++
+ #pragma mark VK_EXT_private_data extension
+ 
+ MVK_PUBLIC_VULKAN_CORE_ALIAS(vkCreatePrivateDataSlot, EXT);
+-- 
+2.56.0
+
