@@ -1,0 +1,480 @@
+From 22a21f6c6691b46de856799fc8e01a14af291641 Mon Sep 17 00:00:00 2001
+From: Weizhao Ouyang <o451686892@gmail.com>
+Date: Thu, 22 Oct 2026 16:50:45 +0800
+Subject: [PATCH] kk: Add VK_KHR_cooperative_matrix support
+
+Signed-off-by: Weizhao Ouyang <o451686892@gmail.com>
+---
+ src/compiler/nir/nir_divergence_analysis.c    |   1 +
+ src/compiler/nir/nir_intrinsics.py            |   3 +
+ src/kosmickrisp/compiler/meson.build          |   1 +
+ .../msl_nir_lower_cooperative_matrix.c        | 211 ++++++++++++++++++
+ src/kosmickrisp/compiler/msl_type_inference.c |   5 +
+ src/kosmickrisp/compiler/nir_to_msl.c         |  30 +++
+ src/kosmickrisp/compiler/nir_to_msl.h         |   2 +
+ src/kosmickrisp/kosmicomp.c                   |   3 +
+ src/kosmickrisp/vulkan/kk_debug.c             |   1 +
+ src/kosmickrisp/vulkan/kk_debug.h             |   1 +
+ src/kosmickrisp/vulkan/kk_physical_device.c   |  38 ++++
+ 11 files changed, 296 insertions(+)
+ create mode 100644 src/kosmickrisp/compiler/msl_nir_lower_cooperative_matrix.c
+
+diff --git a/src/compiler/nir/nir_divergence_analysis.c b/src/compiler/nir/nir_divergence_analysis.c
+index 7f5686d1ec86..c899e62c5723 100644
+--- a/src/compiler/nir/nir_divergence_analysis.c
++++ b/src/compiler/nir/nir_divergence_analysis.c
+@@ -1088,6 +1088,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
+    case nir_intrinsic_cmat_extract:
+    case nir_intrinsic_cmat_muladd_amd:
+    case nir_intrinsic_cmat_muladd_pan:
++   case nir_intrinsic_simdgroup_matrix_muladd_kk:
+    case nir_intrinsic_dpas_intel:
+    case nir_intrinsic_convert_cmat_intel:
+    case nir_intrinsic_load_coverage_mask_intel:
+diff --git a/src/compiler/nir/nir_intrinsics.py b/src/compiler/nir/nir_intrinsics.py
+index da8ad45e299d..a2ffa4a00e17 100644
+--- a/src/compiler/nir/nir_intrinsics.py
++++ b/src/compiler/nir/nir_intrinsics.py
+@@ -3321,6 +3321,9 @@ intrinsic("is_null_descriptor", src_comp=[-1], dest_comp=1, flags=[CAN_ELIMINATE
+ # Represents a pointer to the start of an argument buffer at the
+ # given binding
+ load("buffer_ptr_kk", [], [BINDING], [CAN_ELIMINATE, CAN_REORDER])
++
++intrinsic("simdgroup_matrix_muladd_kk", [2, 2, 2], dest_comp=2,
++          bit_sizes=[16, 32], flags=SUBGROUP_FLAGS)
+ # Represents a pointer to the start of the per-draw data buffer
+ load("per_draw_ptr_kk", [], [], [CAN_ELIMINATE, CAN_REORDER])
+ # Opaque texture<T> handle, with DEST_TYPE representing T
+diff --git a/src/kosmickrisp/compiler/meson.build b/src/kosmickrisp/compiler/meson.build
+index 91cb3f9d6185..2478f28b22a6 100644
+--- a/src/kosmickrisp/compiler/meson.build
++++ b/src/kosmickrisp/compiler/meson.build
+@@ -8,6 +8,7 @@ libmsl_compiler_files = files(
+     'msl_iomap.c',
+     'msl_nir_gather_common.c',
+     'msl_nir_lower_common.c',
++    'msl_nir_lower_cooperative_matrix.c',
+     'msl_nir_lower_input_attachments.c',
+     'msl_nir_lower_subgroups.c',
+ )
+diff --git a/src/kosmickrisp/compiler/msl_nir_lower_cooperative_matrix.c b/src/kosmickrisp/compiler/msl_nir_lower_cooperative_matrix.c
+new file mode 100644
+index 000000000000..c257d8879538
+--- /dev/null
++++ b/src/kosmickrisp/compiler/msl_nir_lower_cooperative_matrix.c
+@@ -0,0 +1,211 @@
++#include "nir_to_msl.h"
++#include "nir_builder.h"
++
++static const struct glsl_type *
++lower_matrix_type(const struct glsl_type *type)
++{
++   if (glsl_type_is_cmat(type)) {
++      const struct glsl_cmat_description *desc = glsl_get_cmat_description(type);
++      assert(desc->rows == 8 && desc->cols == 8);
++      assert(desc->element_type == GLSL_TYPE_FLOAT16 ||
++             desc->element_type == GLSL_TYPE_FLOAT);
++      return glsl_vector_type(desc->element_type, 2);
++   }
++
++   if (glsl_type_is_array(type)) {
++      const struct glsl_type *element = glsl_get_array_element(type);
++      const struct glsl_type *lowered = lower_matrix_type(element);
++      if (lowered != element)
++         return glsl_array_type(lowered, glsl_get_length(type),
++                                glsl_get_explicit_stride(type));
++   }
++
++   return type;
++}
++
++static struct glsl_cmat_description
++matrix_description(nir_src source)
++{
++   return *glsl_get_cmat_description(nir_src_as_deref(source)->type);
++}
++
++static nir_def *
++load_matrix(nir_builder *builder, nir_src source)
++{
++   struct glsl_cmat_description desc = matrix_description(source);
++   return nir_build_load_deref(builder, 2,
++                              glsl_base_type_bit_size(desc.element_type),
++                              source.ssa, 0);
++}
++
++static void
++matrix_coordinates(nir_builder *builder, nir_def **row, nir_def **column)
++{
++   nir_def *lane = nir_load_subgroup_invocation(builder);
++   *row = nir_ior(builder,
++                  nir_iand_imm(builder, nir_ushr_imm(builder, lane, 1), 3),
++                  nir_iand_imm(builder, nir_ushr_imm(builder, lane, 2), 4));
++   *column = nir_ior(builder,
++                     nir_ishl_imm(builder, nir_iand_imm(builder, lane, 1), 1),
++                     nir_iand_imm(builder, nir_ushr_imm(builder, lane, 1), 4));
++}
++
++static nir_def *
++transpose_matrix(nir_builder *builder, nir_def *matrix)
++{
++   nir_def *row, *column;
++   matrix_coordinates(builder, &row, &column);
++   nir_def *elements[2];
++   for (unsigned element = 0; element < 2; ++element) {
++      nir_def *source_row = nir_iadd_imm(builder, column, element);
++      nir_def *lane = nir_ior(builder,
++         nir_ishl_imm(builder, nir_iand_imm(builder, source_row, 3), 1),
++         nir_ishl_imm(builder, nir_iand_imm(builder, source_row, 4), 2));
++      lane = nir_ior(builder, lane,
++         nir_ior(builder,
++            nir_ushr_imm(builder, nir_iand_imm(builder, row, 2), 1),
++            nir_ishl_imm(builder, nir_iand_imm(builder, row, 4), 1)));
++      nir_def *first = nir_read_invocation(builder,
++                                          nir_channel(builder, matrix, 0), lane);
++      nir_def *second = nir_read_invocation(builder,
++                                           nir_channel(builder, matrix, 1), lane);
++      elements[element] = nir_bcsel(builder,
++         nir_ine_imm(builder, nir_iand_imm(builder, row, 1), 0), second, first);
++   }
++   return nir_vec(builder, elements, 2);
++}
++
++static void
++lower_matrix_memory(nir_builder *builder, nir_intrinsic_instr *intrinsic)
++{
++   bool load = intrinsic->intrinsic == nir_intrinsic_cmat_load;
++   struct glsl_cmat_description desc = matrix_description(intrinsic->src[!load]);
++   nir_deref_instr *pointer = nir_src_as_deref(intrinsic->src[load]);
++   unsigned pointer_stride = glsl_get_bit_size(pointer->type) / 8 *
++                             glsl_get_vector_elements(pointer->type);
++   pointer = nir_build_deref_cast(builder, &pointer->def, pointer->modes,
++                                  pointer->type, pointer_stride);
++   nir_def *row, *column;
++   matrix_coordinates(builder, &row, &column);
++   nir_def *values[2];
++   nir_def *matrix = load ? NULL : load_matrix(builder, intrinsic->src[1]);
++   for (unsigned element = 0; element < 2; ++element) {
++      nir_def *major = row;
++      nir_def *minor = nir_iadd_imm(builder, column, element);
++      if (nir_intrinsic_matrix_layout(intrinsic) == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR)
++         SWAP(major, minor);
++      major = nir_imul(builder, major, intrinsic->src[2].ssa);
++      nir_deref_instr *address = nir_build_deref_ptr_as_array(builder, pointer,
++         nir_u2uN(builder, major, pointer->def.bit_size));
++      address = nir_build_deref_cast(builder, &address->def, pointer->modes,
++         glsl_scalar_type(desc.element_type),
++         glsl_base_type_bit_size(desc.element_type) / 8);
++      address = nir_build_deref_ptr_as_array(builder, address,
++         nir_u2uN(builder, minor, address->def.bit_size));
++      if (load)
++         values[element] = nir_load_deref(builder, address);
++      else
++         nir_store_deref(builder, address, nir_channel(builder, matrix, element), 1);
++   }
++   if (load)
++      nir_store_deref(builder, nir_src_as_deref(intrinsic->src[0]),
++                      nir_vec(builder, values, 2), 3);
++}
++
++static bool
++lower_matrix_intrinsic(nir_builder *builder, nir_intrinsic_instr *intrinsic,
++                       void *data)
++{
++   builder->cursor = nir_before_instr(&intrinsic->instr);
++   nir_def *value;
++   switch (intrinsic->intrinsic) {
++   case nir_intrinsic_cmat_length:
++      nir_def_replace(&intrinsic->def, nir_imm_int(builder, 2));
++      return true;
++   case nir_intrinsic_cmat_construct:
++      value = nir_replicate(builder, intrinsic->src[1].ssa, 2);
++      break;
++   case nir_intrinsic_cmat_load:
++   case nir_intrinsic_cmat_store:
++      lower_matrix_memory(builder, intrinsic);
++      nir_instr_remove(&intrinsic->instr);
++      return true;
++   case nir_intrinsic_cmat_muladd:
++      assert(!nir_intrinsic_saturate(intrinsic));
++      value = nir_simdgroup_matrix_muladd_kk(builder,
++         glsl_base_type_bit_size(matrix_description(intrinsic->src[0]).element_type),
++         load_matrix(builder, intrinsic->src[1]),
++         load_matrix(builder, intrinsic->src[2]),
++         load_matrix(builder, intrinsic->src[3]));
++      break;
++   case nir_intrinsic_cmat_copy:
++   case nir_intrinsic_cmat_bitcast:
++      value = load_matrix(builder, intrinsic->src[1]);
++      break;
++   case nir_intrinsic_cmat_convert:
++   case nir_intrinsic_cmat_transpose: {
++      builder->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intrinsic);
++      value = load_matrix(builder, intrinsic->src[1]);
++      if (intrinsic->intrinsic == nir_intrinsic_cmat_transpose)
++         value = transpose_matrix(builder, value);
++      unsigned bits = glsl_base_type_bit_size(
++         matrix_description(intrinsic->src[0]).element_type);
++      value = nir_f2fN(builder, value, bits);
++      break;
++   }
++   case nir_intrinsic_cmat_unary_op:
++      builder->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intrinsic);
++      value = nir_build_alu1(builder, nir_intrinsic_alu_op(intrinsic),
++                            load_matrix(builder, intrinsic->src[1]));
++      break;
++   case nir_intrinsic_cmat_binary_op:
++   case nir_intrinsic_cmat_scalar_op:
++      builder->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intrinsic);
++      value = nir_build_alu2(builder, nir_intrinsic_alu_op(intrinsic),
++         load_matrix(builder, intrinsic->src[1]),
++         intrinsic->intrinsic == nir_intrinsic_cmat_scalar_op ?
++            intrinsic->src[2].ssa : load_matrix(builder, intrinsic->src[2]));
++      break;
++   case nir_intrinsic_cmat_extract:
++      value = nir_vector_extract(builder, load_matrix(builder, intrinsic->src[0]),
++                                  intrinsic->src[1].ssa);
++      nir_def_replace(&intrinsic->def, value);
++      return true;
++   case nir_intrinsic_cmat_insert:
++      value = nir_vector_insert(builder, load_matrix(builder, intrinsic->src[2]),
++                                 intrinsic->src[1].ssa, intrinsic->src[3].ssa);
++      break;
++   default:
++      return false;
++   }
++
++   nir_store_deref(builder, nir_src_as_deref(intrinsic->src[0]), value, 3);
++   nir_instr_remove(&intrinsic->instr);
++   builder->fp_math_ctrl = nir_fp_fast_math;
++   return true;
++}
++
++bool
++msl_nir_lower_cooperative_matrix(nir_shader *shader)
++{
++   bool progress = nir_shader_intrinsics_pass(shader, lower_matrix_intrinsic,
++      nir_metadata_none, NULL);
++   if (!progress)
++      return false;
++
++   nir_foreach_variable_with_modes(variable, shader, nir_var_shader_temp)
++      variable->type = lower_matrix_type(variable->type);
++   nir_foreach_function_impl(implementation, shader) {
++      nir_foreach_function_temp_variable(variable, implementation)
++         variable->type = lower_matrix_type(variable->type);
++      nir_foreach_block(block, implementation) {
++         nir_foreach_instr(instruction, block) {
++            if (instruction->type == nir_instr_type_deref) {
++               nir_deref_instr *deref = nir_instr_as_deref(instruction);
++               deref->type = lower_matrix_type(deref->type);
++            }
++         }
++      }
++   }
++   return true;
++}
+diff --git a/src/kosmickrisp/compiler/msl_type_inference.c b/src/kosmickrisp/compiler/msl_type_inference.c
+index 12e46d59566b..96ccb0f69bc8 100644
+--- a/src/kosmickrisp/compiler/msl_type_inference.c
++++ b/src/kosmickrisp/compiler/msl_type_inference.c
+@@ -394,6 +394,11 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
+    case nir_intrinsic_store_clip_distance_kk:
+       set_type(types, &instr->src[0], TYPE_FLOAT);
+       break;
++   case nir_intrinsic_simdgroup_matrix_muladd_kk:
++      set_type(types, &instr->def, TYPE_FLOAT);
++      for (unsigned source = 0; source < 3; ++source)
++         set_type(types, &instr->src[source], TYPE_FLOAT);
++      break;
+    case nir_intrinsic_ddx:
+    case nir_intrinsic_ddy:
+    case nir_intrinsic_ddx_coarse:
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 63d2ec1276b9..5825196fe017 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1095,6 +1095,15 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       P_IND(ctx, "t%d = ", instr->def.index);
+    }
+    switch (instr->intrinsic) {
++   case nir_intrinsic_simdgroup_matrix_muladd_kk:
++      P(ctx, "kk_matrix_muladd(");
++      for (unsigned source = 0; source < 3; ++source) {
++         if (source)
++            P(ctx, ", ");
++         src_to_msl(ctx, &instr->src[source]);
++      }
++      P(ctx, ");\n");
++      break;
+    case nir_intrinsic_decl_reg: {
+       const char *reg_type = msl_uint_type(nir_intrinsic_bit_size(instr),
+                                            nir_intrinsic_num_components(instr));
+@@ -2226,6 +2235,7 @@ msl_preprocess_nir(struct nir_shader *nir)
+    NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
+             nir_shader_get_entrypoint(nir), nir_var_shader_out);
+    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
++   NIR_PASS(_, nir, msl_nir_lower_cooperative_matrix);
+    NIR_PASS(_, nir, nir_split_var_copies);
+    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
+    NIR_PASS(_, nir, nir_split_array_vars, nir_var_function_temp);
+@@ -2508,8 +2518,28 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+        shader->info.stage == MESA_SHADER_TESS_CTRL)
+       P(&ctx, "#include <metal_compute>\n");
+    P(&ctx, "#include <metal_stdlib>\n");
++   P(&ctx, "#include <metal_simdgroup_matrix>\n");
+    P(&ctx, "using namespace metal;\n");
+ 
++   if (shader->info.stage == MESA_SHADER_COMPUTE) {
++      P(&ctx,
++        "template<typename Input, typename Accumulator>\n"
++            "vec<Accumulator, 2> kk_matrix_muladd(vec<Input, 2> input_a, "
++            "vec<Input, 2> input_b, vec<Accumulator, 2> accumulator) {\n"
++            "   simdgroup_matrix<Input, 8, 8> matrix_a, matrix_b;\n"
++            "   simdgroup_matrix<Accumulator, 8, 8> matrix_c, result;\n"
++            "   matrix_a.thread_elements()[0] = input_a.x; "
++            "matrix_a.thread_elements()[1] = input_a.y;\n"
++            "   matrix_b.thread_elements()[0] = input_b.x; "
++            "matrix_b.thread_elements()[1] = input_b.y;\n"
++            "   matrix_c.thread_elements()[0] = accumulator.x; "
++            "matrix_c.thread_elements()[1] = accumulator.y;\n"
++            "   simdgroup_multiply_accumulate(result, matrix_a, matrix_b, matrix_c);\n"
++        "   return vec<Accumulator, 2>(result.thread_elements()[0], "
++        "result.thread_elements()[1]);\n"
++        "}\n");
++   }
++
+    msl_emit_constant_data(&ctx, shader);
+ 
+    msl_emit_io_blocks(&ctx, shader);
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.h b/src/kosmickrisp/compiler/nir_to_msl.h
+index 423df8ab87c4..377671f4e531 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.h
++++ b/src/kosmickrisp/compiler/nir_to_msl.h
+@@ -35,6 +35,8 @@ bool msl_optimize_nir(struct nir_shader *nir);
+ /* Call this before all API-speicific lowerings, it will */
+ void msl_preprocess_nir(struct nir_shader *nir);
+ 
++bool msl_nir_lower_cooperative_matrix(nir_shader *nir);
++
+ /* Call this before all API-specific lowerings. It will pre-process with
+  * instruction workarounds based on the disabled workarounds bitmask. */
+ void msl_preprocess_nir_workarounds(struct nir_shader *nir,
+diff --git a/src/kosmickrisp/kosmicomp.c b/src/kosmickrisp/kosmicomp.c
+index 911b289f6dbe..fc1fe3bb9c30 100644
+--- a/src/kosmickrisp/kosmicomp.c
++++ b/src/kosmickrisp/kosmicomp.c
+@@ -69,6 +69,8 @@ static void
+ optimize(nir_shader *nir)
+ {
+    msl_preprocess_nir(nir);
++   nir_foreach_function_impl(implementation, nir)
++      nir_metadata_require(implementation, nir_metadata_divergence);
+    msl_preprocess_nir_workarounds(nir, 0);
+ 
+    nir_lower_compute_system_values_options csv_options = {
+@@ -181,6 +183,7 @@ main(int argc, char **argv)
+    nir_print_shader(shader, stdout);
+    optimize(shader);
+    nir_print_shader(shader, stdout);
++   nir_shader_gather_info(shader, nir_shader_get_entrypoint(shader));
+ 
+    struct nir_to_msl_options translate_options = {
+       .mem_ctx = shader,
+diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
+index 1805d6644d2c..9bac64dc1cf3 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.c
++++ b/src/kosmickrisp/vulkan/kk_debug.c
+@@ -23,6 +23,7 @@ const struct debug_named_value experimental_flags[] = {
+    {"custom_border", KK_EXPERIMENTAL_CUSTOM_BORDER},
+    {"image_view_min_lod", KK_EXPERIMENTAL_IMAGE_VIEW_MIN_LOD},
+    {"m5_optimize_e5b9g9r9", KK_EXPERIMENTAL_M5_OPTIMIZE_E5B9G9R9},
++   {"cooperative_matrix", KK_EXPERIMENTAL_COOPERATIVE_MATRIX},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
+index f45480442130..83a890469d77 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.h
++++ b/src/kosmickrisp/vulkan/kk_debug.h
+@@ -26,6 +26,7 @@ enum kk_experimental {
+    /* Using allowGPUOptimizedContents on M5 for this format causes
+     * vkCmdCopyImage() tests in CTS to fail, but it is otherwise usable */
+    KK_EXPERIMENTAL_M5_OPTIMIZE_E5B9G9R9 = 1ull << 2,
++   KK_EXPERIMENTAL_COOPERATIVE_MATRIX = 1ull << 3,
+ };
+ 
+ extern enum kk_experimental kk_mesa_experimental_flags;
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 2d5be6bde576..91db83614f49 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -143,6 +143,8 @@ kk_get_device_extensions(const struct kk_instance *instance,
+ 
+       /* Optional extensions */
+       .KHR_calibrated_timestamps = true,
++      .KHR_cooperative_matrix = pdev->info.gpu_apple_family >= 7 &&
++                    KK_EXPERIMENTAL(COOPERATIVE_MATRIX),
+       .KHR_deferred_host_operations = true,
+       .KHR_maintenance7 = true,
+       .KHR_maintenance8 = true,
+@@ -507,6 +509,9 @@ kk_get_device_features(
+       /* VK_KHR_shader_subgroup_uniform_control_flow */
+       .shaderSubgroupUniformControlFlow = true,
+ 
++      .cooperativeMatrix = supported_extensions->KHR_cooperative_matrix,
++      .cooperativeMatrixRobustBufferAccess = false,
++
+       /* VK_EXT_shader_atomic_float */
+       .shaderBufferFloat32Atomics = true,
+       .shaderBufferFloat32AtomicAdd = true,
+@@ -547,6 +552,8 @@ kk_get_device_properties(
+                               : 4000;
+ 
+    *properties = (struct vk_properties){
++      .cooperativeMatrixSupportedStages =
++         supported_extensions->KHR_cooperative_matrix ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
+       .apiVersion = kk_get_vk_version(),
+       .driverVersion = vk_get_driver_version(),
+       .vendorID =
+@@ -1326,6 +1333,37 @@ kk_GetPhysicalDeviceMemoryProperties2(
+    }
+ }
+ 
++VKAPI_ATTR VkResult VKAPI_CALL
++kk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
++   VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
++   VkCooperativeMatrixPropertiesKHR *pProperties)
++{
++   VK_FROM_HANDLE(kk_physical_device, pdev, physicalDevice);
++   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties,
++                          pPropertyCount);
++
++   if (pdev->vk.supported_extensions.KHR_cooperative_matrix) {
++      for (unsigned combination = 0; combination < 3; ++combination) {
++         vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, property)
++         {
++            property->MSize = 8;
++            property->NSize = 8;
++            property->KSize = 8;
++            property->AType = combination == 2 ? VK_COMPONENT_TYPE_FLOAT32_KHR :
++                                                VK_COMPONENT_TYPE_FLOAT16_KHR;
++            property->BType = property->AType;
++            property->CType = combination == 0 ? VK_COMPONENT_TYPE_FLOAT16_KHR :
++                                                VK_COMPONENT_TYPE_FLOAT32_KHR;
++            property->ResultType = property->CType;
++            property->saturatingAccumulation = false;
++            property->scope = VK_SCOPE_SUBGROUP_KHR;
++         }
++      }
++   }
++
++   return vk_outarray_status(&out);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_GetPhysicalDeviceQueueFamilyProperties2(
+    VkPhysicalDevice physicalDevice, uint32_t *pQueueFamilyPropertyCount,
+-- 
+2.56.0
+

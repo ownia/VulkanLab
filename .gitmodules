@@ -46,3 +46,11 @@
 	path = third_party/SPIRV-Headers
 	url = https://github.com/KhronosGroup/SPIRV-Headers.git
 	branch = main
+[submodule "third_party/Vulkan-Loader"]
+	path = third_party/Vulkan-Loader
+	url = https://github.com/KhronosGroup/Vulkan-Loader.git
+	branch = main
+[submodule "third_party/SPIRV-LLVM-Translator"]
+	path = third_party/SPIRV-LLVM-Translator
+	url = https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git
+	branch = main
