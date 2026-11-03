@@ -35,15 +35,58 @@ if ! command -v llvm-config >/dev/null 2>&1; then
     exit 1
 fi
 
-sh "$ROOT/../../scripts/prepare_dependencies.sh" "$ROOT" "$SOURCE_DIR"
+sh "$ROOT/../../scripts/prepare_dependencies.sh" "${KOSMICKRISP_LAB_DIR:-$ROOT}" "$SOURCE_DIR"
 VULKAN_INCLUDE_DIR="$SOURCE_DIR/Vulkan-Headers/include"
 
+set --
 for patch in "$ROOT/patch/mesa"/*.patch; do
-    if ! git -C "$SOURCE_DIR/mesa" apply --reverse --check "$patch" 2>/dev/null; then
-        git -C "$SOURCE_DIR/mesa" apply --check "$patch"
-        git -C "$SOURCE_DIR/mesa" apply "$patch"
-    fi
+    [ -f "$patch" ] || continue
+    set -- "$@" "$patch"
 done
+if [ -n "${KOSMICKRISP_EXTRA_PATCH_DIR:-}" ]; then
+    for patch in "$KOSMICKRISP_EXTRA_PATCH_DIR"/*.patch; do
+        [ -f "$patch" ] || continue
+        set -- "$@" "$patch"
+    done
+fi
+apply_patches() (
+    repository=$1
+    shift
+    [ "$#" -gt 0 ] || exit 0
+    patch_work_dir=$(mktemp -d)
+    trap 'rm -rf "$patch_work_dir"' EXIT
+    trap 'exit 1' HUP INT TERM
+
+    if (
+        export GIT_INDEX_FILE="$patch_work_dir/index"
+        git -C "$repository" read-tree HEAD || exit 1
+        git -C "$repository" add -A || exit 1
+        first_patch=1
+        for patch do
+            if [ "$first_patch" -eq 1 ]; then
+                set --
+                first_patch=0
+            fi
+            set -- "$patch" "$@"
+        done
+        for patch do
+            git -C "$repository" apply --cached --reverse "$patch" 2>/dev/null || exit 1
+        done
+    ); then
+        printf 'Patches already applied: %s\n' "$repository"
+        exit 0
+    fi
+
+    for patch do
+        if git -C "$repository" apply --reverse --check "$patch" 2>/dev/null; then
+            continue
+        fi
+        git -C "$repository" apply --check "$patch"
+        printf 'Applying patch %s to %s\n' "$(basename -- "$patch")" "$repository"
+        git -C "$repository" apply "$patch"
+    done
+)
+apply_patches "$SOURCE_DIR/mesa" "$@"
 
 SPIRV_TOOLS_BUILD_DIR="$BUILD_DIR/SPIRV-Tools/$CONFIGURATION/build"
 SPIRV_TOOLS_INSTALL_DIR="$SPIRV_TOOLS_BUILD_DIR/install"
@@ -110,6 +153,10 @@ meson compile -C "$MESA_BUILD_DIR" -j "${JOBS:-4}"
 if [ ! -f "$KOSMICKRISP_LIBRARY" ]; then
     printf 'KosmicKrisp library not found: %s\n' "$KOSMICKRISP_LIBRARY" >&2
     exit 1
+fi
+
+if [ "${KOSMICKRISP_SKIP_BENCHMARKS:-0}" = 1 ]; then
+    exit 0
 fi
 
 for benchmark in vkpeak vk_cooperative_matrix_perf; do

@@ -1,0 +1,54 @@
+{
+  "api": [
+    "dEQP-VK.info.device_properties",
+    "dEQP-VK.info.device_extensions",
+    "dEQP-VK.info.device_extension_dependencies",
+    "dEQP-VK.info.device_mandatory_features",
+    "dEQP-VK.api.info.get_physical_device_properties2.features.cooperative_matrix_features_khr",
+    "dEQP-VK.api.info.get_physical_device_properties2.features.cooperative_matrix_maintenance1_features_ext"
+  ],
+  "properties": [
+    "dEQP-VK.compute.pipeline.cooperative_matrix.maintenance1.required_type_combinations"
+  ],
+  "core": [
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.length.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.constant.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.composite.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.composite_rvalue.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.add.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.sub.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.div.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.mul.float32_float32.buffer.*.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.negate.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.matrixtimesscalar.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.func.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.func_const_in.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.composite_array.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.matrixmuladd*.float32_float32.buffer.*.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.matrixmuladd.float16_float16.buffer.*.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.matrixmuladd.float16_float32.buffer.*.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.matrixmuladd.uint8_uint32.buffer.*.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.matrixmuladd.uint8_sint32.buffer.*.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.matrixmuladd.sint8_sint32.buffer.*.linear"
+  ],
+  "operations": [
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_sum_row_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_sum_col_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_sum_rowcol_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_sum_2x2_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_sum_row_changedim_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_sum_col_changedim_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_sum_rowcol_changedim_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_min_row_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_min_col_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_min_rowcol_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.reduce_min_2x2_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.per_element_op_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.per_element_op_row_col_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.per_element_op_struct_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.per_element_op_mat_maint1.float32_float32.buffer.rowmajor.linear",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.convert_maint1_dst_khr_*.input_float32*_output_float16*.buffer.rowmajor",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_r.subgroupscope.transpose_maint1_dst_khr_*.input_float32*_output_float32*.buffer.rowmajor",
+    "dEQP-VK.compute.pipeline.cooperative_matrix.khr_*.subgroupscope.getcoordinate.float32_float32.buffer.rowmajor.linear"
+  ]
+}

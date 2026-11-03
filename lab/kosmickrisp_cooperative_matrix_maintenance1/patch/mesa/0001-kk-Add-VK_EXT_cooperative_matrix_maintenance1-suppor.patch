@@ -1,0 +1,465 @@
+From 8ae1dab0c43e7e5c31dc79945db55bdd874a100d Mon Sep 17 00:00:00 2001
+From: Weizhao Ouyang <o451686892@gmail.com>
+Date: Wed, 28 Oct 2026 18:36:22 +0800
+Subject: [PATCH] kk: Add VK_EXT_cooperative_matrix_maintenance1 support
+
+Signed-off-by: Weizhao Ouyang <o451686892@gmail.com>
+---
+ .../nir/nir_lower_cooperative_matrix.c        |  24 +-
+ .../msl_nir_lower_cooperative_matrix.c        | 238 +++++++++++++++++-
+ src/kosmickrisp/compiler/nir_to_msl.c         |   9 +-
+ src/kosmickrisp/vulkan/kk_debug.c             |   1 +
+ src/kosmickrisp/vulkan/kk_debug.h             |   1 +
+ src/kosmickrisp/vulkan/kk_physical_device.c   |  46 ++++
+ 6 files changed, 299 insertions(+), 20 deletions(-)
+
+diff --git a/src/compiler/nir/nir_lower_cooperative_matrix.c b/src/compiler/nir/nir_lower_cooperative_matrix.c
+index f1344ba11736..8d2172d51df8 100644
+--- a/src/compiler/nir/nir_lower_cooperative_matrix.c
++++ b/src/compiler/nir/nir_lower_cooperative_matrix.c
+@@ -647,16 +647,22 @@ split_cmat_reduce_row_col(nir_builder *b,
+             call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
+          }
+       } else if (reduce & NIR_CMAT_REDUCE_ROW) {
+-         for (unsigned i = 1; i < src_split->box.outer_cols; i++) {
+-            nir_deref_instr *second_deref = temp_derefs[i];
+-            b->cursor = nir_before_instr(instr);
+-            call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
++         for (unsigned row = 0; row < src_split->box.outer_rows; ++row) {
++            unsigned first = row * src_split->box.outer_cols;
++            for (unsigned column = 1; column < src_split->box.outer_cols; ++column) {
++               b->cursor = nir_before_instr(instr);
++               call_reduce_finish(b, call, reduce, &temp_derefs[first]->def,
++                  &temp_derefs[first]->def, &temp_derefs[first + column]->def);
++            }
+          }
+       } else if (reduce & NIR_CMAT_REDUCE_COLUMN) {
+-         for (unsigned i = 1; i < src_split->box.outer_rows; i++) {
+-            nir_deref_instr *second_deref = temp_derefs[i * src_split->box.outer_cols];
+-            b->cursor = nir_before_instr(instr);
+-            call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
++         for (unsigned column = 0; column < src_split->box.outer_cols; ++column) {
++            for (unsigned row = 1; row < src_split->box.outer_rows; ++row) {
++               unsigned second = row * src_split->box.outer_cols + column;
++               b->cursor = nir_before_instr(instr);
++               call_reduce_finish(b, call, reduce, &temp_derefs[column]->def,
++                  &temp_derefs[column]->def, &temp_derefs[second]->def);
++            }
+          }
+       }
+    }
+@@ -671,7 +677,7 @@ split_cmat_reduce_row_col(nir_builder *b,
+             if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) == (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN))
+                idx = 0;
+             else if (reduce & NIR_CMAT_REDUCE_ROW)
+-               idx = r % (src_split ? src_split->box.outer_rows : 1);
++               idx = src_split ? (r % src_split->box.outer_rows) * src_split->box.outer_cols : 0;
+             else if (reduce & NIR_CMAT_REDUCE_COLUMN)
+                idx = c % (src_split ? src_split->box.outer_cols : 1);
+             else
+diff --git a/src/kosmickrisp/compiler/msl_nir_lower_cooperative_matrix.c b/src/kosmickrisp/compiler/msl_nir_lower_cooperative_matrix.c
+index c257d8879538..637c8e028e85 100644
+--- a/src/kosmickrisp/compiler/msl_nir_lower_cooperative_matrix.c
++++ b/src/kosmickrisp/compiler/msl_nir_lower_cooperative_matrix.c
+@@ -8,7 +8,11 @@ lower_matrix_type(const struct glsl_type *type)
+       const struct glsl_cmat_description *desc = glsl_get_cmat_description(type);
+       assert(desc->rows == 8 && desc->cols == 8);
+       assert(desc->element_type == GLSL_TYPE_FLOAT16 ||
+-             desc->element_type == GLSL_TYPE_FLOAT);
++               desc->element_type == GLSL_TYPE_FLOAT ||
++               desc->element_type == GLSL_TYPE_UINT8 ||
++               desc->element_type == GLSL_TYPE_INT8 ||
++               desc->element_type == GLSL_TYPE_UINT ||
++               desc->element_type == GLSL_TYPE_INT);
+       return glsl_vector_type(desc->element_type, 2);
+    }
+ 
+@@ -50,6 +54,49 @@ matrix_coordinates(nir_builder *builder, nir_def **row, nir_def **column)
+                      nir_iand_imm(builder, nir_ushr_imm(builder, lane, 1), 4));
+ }
+ 
++static nir_def *
++matrix_lane(nir_builder *builder, nir_def *row, nir_def *column);
++
++static nir_def *
++matrix_element(nir_builder *builder, nir_def *matrix,
++               nir_def *row, nir_def *column)
++{
++   nir_def *lane = matrix_lane(builder, row, column);
++   nir_def *first = nir_shuffle(builder, nir_channel(builder, matrix, 0), lane);
++   nir_def *second = nir_shuffle(builder, nir_channel(builder, matrix, 1), lane);
++   return nir_bcsel(builder,
++      nir_ine_imm(builder, nir_iand_imm(builder, column, 1), 0), second, first);
++}
++
++static nir_def *
++integer_matrix_muladd(nir_builder *builder, nir_intrinsic_instr *intrinsic)
++{
++   nir_cmat_signed signed_mask = nir_intrinsic_cmat_signed_mask(intrinsic);
++   nir_def *left = load_matrix(builder, intrinsic->src[1]);
++   nir_def *right = load_matrix(builder, intrinsic->src[2]);
++   left = signed_mask & NIR_CMAT_A_SIGNED ? nir_i2iN(builder, left, 32) :
++                                          nir_u2uN(builder, left, 32);
++   right = signed_mask & NIR_CMAT_B_SIGNED ? nir_i2iN(builder, right, 32) :
++                                           nir_u2uN(builder, right, 32);
++   nir_def *accumulator = load_matrix(builder, intrinsic->src[3]);
++   nir_def *values[2] = {
++      nir_channel(builder, accumulator, 0), nir_channel(builder, accumulator, 1),
++   };
++   nir_def *row, *column;
++   matrix_coordinates(builder, &row, &column);
++   for (unsigned inner = 0; inner < 8; ++inner) {
++      nir_def *index = nir_imm_int(builder, inner);
++      nir_def *left_element = matrix_element(builder, left, row, index);
++      for (unsigned element = 0; element < 2; ++element) {
++         nir_def *right_element = matrix_element(builder, right, index,
++            nir_iadd_imm(builder, column, element));
++         values[element] = nir_iadd(builder, values[element],
++            nir_imul(builder, left_element, right_element));
++      }
++   }
++   return nir_vec(builder, values, 2);
++}
++
+ static nir_def *
+ transpose_matrix(nir_builder *builder, nir_def *matrix)
+ {
+@@ -132,11 +179,14 @@ lower_matrix_intrinsic(nir_builder *builder, nir_intrinsic_instr *intrinsic,
+       return true;
+    case nir_intrinsic_cmat_muladd:
+       assert(!nir_intrinsic_saturate(intrinsic));
+-      value = nir_simdgroup_matrix_muladd_kk(builder,
+-         glsl_base_type_bit_size(matrix_description(intrinsic->src[0]).element_type),
+-         load_matrix(builder, intrinsic->src[1]),
+-         load_matrix(builder, intrinsic->src[2]),
+-         load_matrix(builder, intrinsic->src[3]));
++      if (glsl_base_type_is_integer(matrix_description(intrinsic->src[1]).element_type))
++         value = integer_matrix_muladd(builder, intrinsic);
++      else
++         value = nir_simdgroup_matrix_muladd_kk(builder,
++            glsl_base_type_bit_size(matrix_description(intrinsic->src[0]).element_type),
++            load_matrix(builder, intrinsic->src[1]),
++            load_matrix(builder, intrinsic->src[2]),
++            load_matrix(builder, intrinsic->src[3]));
+       break;
+    case nir_intrinsic_cmat_copy:
+    case nir_intrinsic_cmat_bitcast:
+@@ -148,9 +198,16 @@ lower_matrix_intrinsic(nir_builder *builder, nir_intrinsic_instr *intrinsic,
+       value = load_matrix(builder, intrinsic->src[1]);
+       if (intrinsic->intrinsic == nir_intrinsic_cmat_transpose)
+          value = transpose_matrix(builder, value);
+-      unsigned bits = glsl_base_type_bit_size(
+-         matrix_description(intrinsic->src[0]).element_type);
+-      value = nir_f2fN(builder, value, bits);
++      nir_cmat_signed signed_mask = nir_intrinsic_cmat_signed_mask(intrinsic);
++      enum glsl_base_type source_type = glsl_apply_signedness_to_base_type(
++         matrix_description(intrinsic->src[1]).element_type,
++         signed_mask & NIR_CMAT_A_SIGNED);
++      enum glsl_base_type target_type = glsl_apply_signedness_to_base_type(
++         matrix_description(intrinsic->src[0]).element_type,
++         signed_mask & NIR_CMAT_RESULT_SIGNED);
++      value = nir_build_alu1(builder, nir_type_conversion_op(
++         nir_get_nir_type_for_glsl_base_type(source_type),
++         nir_get_nir_type_for_glsl_base_type(target_type), nir_rounding_mode_undef), value);
+       break;
+    }
+    case nir_intrinsic_cmat_unary_op:
+@@ -185,10 +242,171 @@ lower_matrix_intrinsic(nir_builder *builder, nir_intrinsic_instr *intrinsic,
+    return true;
+ }
+ 
++static nir_def *
++reduce_pair(nir_builder *builder, nir_function *function,
++            nir_def *left, nir_def *right)
++{
++   nir_variable *result = nir_local_variable_create(builder->impl,
++      glsl_get_bare_type(function->params[0].type), "matrix_reduce");
++   nir_deref_instr *deref = nir_build_deref_var(builder, result);
++   nir_call(builder, function, &deref->def, left, right);
++   return nir_load_deref(builder, deref);
++}
++
++static nir_def *
++shuffle_xor(nir_builder *builder, nir_def *value, unsigned mask)
++{
++   nir_def *lane = nir_ixor(builder,
++      nir_load_subgroup_invocation(builder), nir_imm_int(builder, mask));
++   return nir_shuffle(builder, value, lane);
++}
++
++static nir_def *
++matrix_lane(nir_builder *builder, nir_def *row, nir_def *column)
++{
++   return nir_ior(builder,
++      nir_ior(builder,
++         nir_ishl_imm(builder, nir_iand_imm(builder, row, 3), 1),
++         nir_ishl_imm(builder, nir_iand_imm(builder, row, 4), 2)),
++      nir_ior(builder,
++         nir_ushr_imm(builder, nir_iand_imm(builder, column, 2), 1),
++         nir_ishl_imm(builder, nir_iand_imm(builder, column, 4), 1)));
++}
++
++static nir_def *
++lower_matrix_reduce(nir_builder *builder, nir_cmat_call_instr *call)
++{
++   nir_def *source = load_matrix(builder, call->params[1]);
++   nir_def *values[2] = {
++      nir_channel(builder, source, 0), nir_channel(builder, source, 1),
++   };
++   nir_cmat_reduce flags = nir_cmat_call_reduce_flags(call);
++   if (call->op == nir_cmat_call_op_reduce_finish) {
++      nir_def *other = load_matrix(builder, call->params[2]);
++      for (unsigned element = 0; element < 2; ++element)
++         values[element] = reduce_pair(builder, call->callee, values[element],
++                                       nir_channel(builder, other, element));
++      return nir_vec(builder, values, 2);
++   }
++
++   if (flags & NIR_CMAT_REDUCE_ROW) {
++      nir_def *value = reduce_pair(builder, call->callee, values[0], values[1]);
++      for (unsigned mask = 1; mask <= 8; mask *= 8)
++         value = reduce_pair(builder, call->callee, value,
++                             shuffle_xor(builder, value, mask));
++      values[0] = values[1] = value;
++   }
++   if (flags & NIR_CMAT_REDUCE_COLUMN) {
++      for (unsigned element = 0; element < 2; ++element) {
++         for (unsigned mask = 2; mask <= 16; mask *= 2) {
++            if (mask == 8)
++               continue;
++            values[element] = reduce_pair(builder, call->callee, values[element],
++               shuffle_xor(builder, values[element], mask));
++         }
++      }
++   }
++   return nir_vec(builder, values, 2);
++}
++
++static nir_def *
++lower_matrix_reduce_2x2(nir_builder *builder, nir_cmat_call_instr *call)
++{
++   nir_def *pairs[4];
++   for (unsigned tile = 0; tile < 4; ++tile) {
++      nir_def *source = load_matrix(builder, call->params[tile + 1]);
++      pairs[tile] = reduce_pair(builder, call->callee,
++         nir_channel(builder, source, 0), nir_channel(builder, source, 1));
++   }
++   nir_def *row, *column;
++   matrix_coordinates(builder, &row, &column);
++   nir_def *values[2];
++   for (unsigned element = 0; element < 2; ++element) {
++      nir_def *target_column = nir_iadd_imm(builder, column, element);
++      nir_def *lane = matrix_lane(builder,
++         nir_iand_imm(builder, nir_ishl_imm(builder, row, 1), 7),
++         nir_iand_imm(builder, nir_ishl_imm(builder, target_column, 1), 7));
++      nir_def *tiles[4];
++      for (unsigned tile = 0; tile < 4; ++tile) {
++         tiles[tile] = reduce_pair(builder, call->callee,
++            nir_shuffle(builder, pairs[tile], lane),
++            nir_shuffle(builder, pairs[tile],
++               nir_ixor(builder, lane, nir_imm_int(builder, 2))));
++      }
++      nir_def *right = nir_uge_imm(builder, target_column, 4);
++      values[element] = nir_bcsel(builder, nir_uge_imm(builder, row, 4),
++         nir_bcsel(builder, right, tiles[3], tiles[2]),
++         nir_bcsel(builder, right, tiles[1], tiles[0]));
++   }
++   return nir_vec(builder, values, 2);
++}
++
++static nir_def *
++lower_matrix_per_element(nir_builder *builder, nir_cmat_call_instr *call)
++{
++   nir_def *source = load_matrix(builder, call->params[3]);
++   nir_variable *result = nir_local_variable_create(builder->impl,
++      glsl_get_bare_type(call->callee->params[0].type), "matrix_element");
++   nir_deref_instr *deref = nir_build_deref_var(builder, result);
++   nir_def *row, *column;
++   matrix_coordinates(builder, &row, &column);
++   row = nir_iadd(builder, row, call->params[1].ssa);
++   column = nir_iadd(builder, column, call->params[2].ssa);
++   nir_def *values[2];
++   for (unsigned element = 0; element < 2; ++element) {
++      nir_call_instr *scalar_call = nir_call_instr_create(builder->shader, call->callee);
++      scalar_call->params[0] = nir_src_for_ssa(&deref->def);
++      scalar_call->params[1] = nir_src_for_ssa(row);
++      scalar_call->params[2] = nir_src_for_ssa(nir_iadd_imm(builder, column, element));
++      scalar_call->params[3] = nir_src_for_ssa(nir_channel(builder, source, element));
++      for (unsigned parameter = 4; parameter < call->num_params; ++parameter) {
++         nir_deref_instr *argument = nir_src_as_deref(call->params[parameter]);
++         nir_def *value = call->params[parameter].ssa;
++         if (argument && glsl_type_is_cmat(argument->type))
++            value = nir_channel(builder,
++               load_matrix(builder, call->params[parameter]), element);
++         scalar_call->params[parameter] = nir_src_for_ssa(value);
++      }
++      nir_builder_instr_insert(builder, &scalar_call->instr);
++      values[element] = nir_load_deref(builder, deref);
++   }
++   return nir_vec(builder, values, 2);
++}
++
++static bool
++lower_matrix_instruction(nir_builder *builder, nir_instr *instruction, void *data)
++{
++   if (instruction->type == nir_instr_type_intrinsic)
++      return lower_matrix_intrinsic(builder, nir_instr_as_intrinsic(instruction), data);
++   if (instruction->type != nir_instr_type_cmat_call)
++      return false;
++
++   builder->cursor = nir_before_instr(instruction);
++   nir_cmat_call_instr *call = nir_instr_as_cmat_call(instruction);
++   nir_def *value;
++   switch (call->op) {
++   case nir_cmat_call_op_reduce:
++   case nir_cmat_call_op_reduce_finish:
++      value = lower_matrix_reduce(builder, call);
++      break;
++   case nir_cmat_call_op_reduce_2x2:
++      value = lower_matrix_reduce_2x2(builder, call);
++      break;
++   case nir_cmat_call_op_per_element_op:
++      value = lower_matrix_per_element(builder, call);
++      break;
++   default:
++      UNREACHABLE("Unsupported cooperative matrix callback");
++   }
++   nir_store_deref(builder, nir_src_as_deref(call->params[0]), value, 3);
++   nir_instr_remove(instruction);
++   return true;
++}
++
+ bool
+ msl_nir_lower_cooperative_matrix(nir_shader *shader)
+ {
+-   bool progress = nir_shader_intrinsics_pass(shader, lower_matrix_intrinsic,
++   bool progress = nir_shader_instructions_pass(shader, lower_matrix_instruction,
+       nir_metadata_none, NULL);
+    if (!progress)
+       return false;
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 5825196fe017..fe91b948691c 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -2226,7 +2226,7 @@ msl_preprocess_nir(struct nir_shader *nir)
+    NIR_PASS(_, nir, nir_lower_returns);
+    NIR_PASS(_, nir, nir_inline_functions);
+    NIR_PASS(_, nir, nir_opt_deref);
+-   nir_remove_non_entrypoints(nir);
++   nir_remove_non_cmat_call_entrypoints(nir);
+ 
+    /* nir_lower_io_to_temporaries is required before nir_lower_blend since the
+     * blending pass sinks writes to the end of the block where we may have a
+@@ -2235,7 +2235,14 @@ msl_preprocess_nir(struct nir_shader *nir)
+    NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
+             nir_shader_get_entrypoint(nir), nir_var_shader_out);
+    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
++   const struct nir_lower_coopmat_args matrix_args = {8, 8, 8};
++   NIR_PASS(_, nir, nir_lower_cooperative_matrix_flexible_dimensions, &matrix_args);
++   NIR_PASS(_, nir, nir_opt_deref);
++   NIR_PASS(_, nir, nir_opt_dce);
++   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
+    NIR_PASS(_, nir, msl_nir_lower_cooperative_matrix);
++   NIR_PASS(_, nir, nir_inline_functions);
++   nir_remove_non_entrypoints(nir);
+    NIR_PASS(_, nir, nir_split_var_copies);
+    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
+    NIR_PASS(_, nir, nir_split_array_vars, nir_var_function_temp);
+diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
+index 9bac64dc1cf3..58c43b3d0649 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.c
++++ b/src/kosmickrisp/vulkan/kk_debug.c
+@@ -24,6 +24,7 @@ const struct debug_named_value experimental_flags[] = {
+    {"image_view_min_lod", KK_EXPERIMENTAL_IMAGE_VIEW_MIN_LOD},
+    {"m5_optimize_e5b9g9r9", KK_EXPERIMENTAL_M5_OPTIMIZE_E5B9G9R9},
+    {"cooperative_matrix", KK_EXPERIMENTAL_COOPERATIVE_MATRIX},
++   {"cooperative_matrix_maintenance1", KK_EXPERIMENTAL_COOPERATIVE_MATRIX_MAINTENANCE1},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
+index 83a890469d77..d388a2644075 100644
+--- a/src/kosmickrisp/vulkan/kk_debug.h
++++ b/src/kosmickrisp/vulkan/kk_debug.h
+@@ -27,6 +27,7 @@ enum kk_experimental {
+     * vkCmdCopyImage() tests in CTS to fail, but it is otherwise usable */
+    KK_EXPERIMENTAL_M5_OPTIMIZE_E5B9G9R9 = 1ull << 2,
+    KK_EXPERIMENTAL_COOPERATIVE_MATRIX = 1ull << 3,
++   KK_EXPERIMENTAL_COOPERATIVE_MATRIX_MAINTENANCE1 = 1ull << 4,
+ };
+ 
+ extern enum kk_experimental kk_mesa_experimental_flags;
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 91db83614f49..2f79e2f7e07a 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -176,6 +176,9 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_border_color_swizzle = KK_EXPERIMENTAL(CUSTOM_BORDER),
+       .EXT_calibrated_timestamps = true,
+       .EXT_conditional_rendering = true,
++      .EXT_cooperative_matrix_maintenance1 = pdev->info.gpu_apple_family >= 7 &&
++              KK_EXPERIMENTAL(COOPERATIVE_MATRIX) &&
++              KK_EXPERIMENTAL(COOPERATIVE_MATRIX_MAINTENANCE1),
+       .EXT_custom_border_color = KK_EXPERIMENTAL(CUSTOM_BORDER),
+       .EXT_custom_resolve = true,
+       .EXT_debug_marker = true,
+@@ -511,6 +514,9 @@ kk_get_device_features(
+ 
+       .cooperativeMatrix = supported_extensions->KHR_cooperative_matrix,
+       .cooperativeMatrixRobustBufferAccess = false,
++      .cooperativeMatrixProperties2 = supported_extensions->EXT_cooperative_matrix_maintenance1,
++      .cooperativeMatrixReductions = supported_extensions->EXT_cooperative_matrix_maintenance1,
++      .cooperativeMatrixPerElementOperations = supported_extensions->EXT_cooperative_matrix_maintenance1,
+ 
+       /* VK_EXT_shader_atomic_float */
+       .shaderBufferFloat32Atomics = true,
+@@ -1364,6 +1370,46 @@ kk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+    return vk_outarray_status(&out);
+ }
+ 
++static const VkComponentTypeKHR kk_maintenance_matrix_types[][2] = {
++   {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR},
++   {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
++   {VK_COMPONENT_TYPE_FLOAT32_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
++   {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_UINT32_KHR},
++   {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR},
++   {VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR},
++};
++
++VKAPI_ATTR VkResult VKAPI_CALL
++kk_GetPhysicalDeviceCooperativeMatrixProperties2EXT(
++   VkPhysicalDevice physicalDevice,
++   const VkPhysicalDeviceCooperativeMatrixInfo2EXT *pCooperativeMatrixInfo,
++   uint32_t *pPropertyCount, VkCooperativeMatrixProperties2EXT *pProperties)
++{
++   VK_FROM_HANDLE(kk_physical_device, pdev, physicalDevice);
++   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixProperties2EXT, out, pProperties,
++                          pPropertyCount);
++
++   if (pdev->vk.supported_extensions.EXT_cooperative_matrix_maintenance1 &&
++       pCooperativeMatrixInfo->scope == VK_SCOPE_SUBGROUP_KHR &&
++       (!pCooperativeMatrixInfo->subgroupSize || pCooperativeMatrixInfo->subgroupSize == 32) &&
++       !pCooperativeMatrixInfo->flags) {
++      for (unsigned combination = 0; combination < ARRAY_SIZE(kk_maintenance_matrix_types); ++combination) {
++         vk_outarray_append_typed(VkCooperativeMatrixProperties2EXT, &out, property)
++         {
++            property->MGranularity = 8;
++            property->NGranularity = 8;
++            property->KGranularity = 8;
++            property->AType = kk_maintenance_matrix_types[combination][0];
++            property->BType = property->AType;
++            property->CType = kk_maintenance_matrix_types[combination][1];
++            property->ResultType = property->CType;
++         }
++      }
++   }
++
++   return vk_outarray_status(&out);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_GetPhysicalDeviceQueueFamilyProperties2(
+    VkPhysicalDevice physicalDevice, uint32_t *pQueueFamilyPropertyCount,
+-- 
+2.56.0
+
