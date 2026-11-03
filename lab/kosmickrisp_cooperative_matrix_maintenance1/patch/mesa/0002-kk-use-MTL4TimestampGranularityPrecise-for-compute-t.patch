@@ -1,0 +1,29 @@
+From 7219657f1b3d5d0b205d82ad30c35058a061dd0b Mon Sep 17 00:00:00 2001
+From: Weizhao Ouyang <o451686892@gmail.com>
+Date: Tue, 3 Nov 2026 16:58:19 +0800
+Subject: [PATCH] kk: use MTL4TimestampGranularityPrecise for compute timestamp
+ writes
+
+https://developer.apple.com/documentation/metal/mtl4timestampgranularity
+
+Signed-off-by: Weizhao Ouyang <o451686892@gmail.com>
+---
+ src/kosmickrisp/bridge/mtl_encoder.m | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_encoder.m
+index 2c355627c13a..6264d2959273 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.m
++++ b/src/kosmickrisp/bridge/mtl_encoder.m
+@@ -494,7 +494,7 @@ mtl_compute_write_timestamp(mtl_compute_encoder *encoder,
+       id<MTL4ComputeCommandEncoder> enc =
+          (id<MTL4ComputeCommandEncoder>)encoder;
+       id<MTL4CounterHeap> h = (id<MTL4CounterHeap>)heap;
+-      [enc writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed
++      [enc writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                                 intoHeap:h
+                                  atIndex:index];
+    }
+-- 
+2.56.0
+
